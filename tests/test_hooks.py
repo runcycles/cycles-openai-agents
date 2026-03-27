@@ -481,7 +481,7 @@ class TestHeartbeat:
         assert task is not None
 
         await h.on_tool_end(mock_context, mock_agent, mock_tool, "result")
-        assert task.cancelled() or task.cancelling()
+        assert task.cancelled() or getattr(task, "cancelling", lambda: False)()
 
     async def test_llm_end_cancels_heartbeat(
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock
@@ -498,7 +498,7 @@ class TestHeartbeat:
         mock_response.usage.input_tokens = 10
         mock_response.usage.output_tokens = 5
         await h.on_llm_end(mock_context, mock_agent, mock_response)
-        assert task.cancelled() or task.cancelling()
+        assert task.cancelled() or getattr(task, "cancelling", lambda: False)()
 
     def test_no_heartbeat_when_ttl_zero(self, mock_client: AsyncMock) -> None:
         h = _hooks(mock_client, ttl_ms=0)

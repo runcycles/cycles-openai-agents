@@ -66,7 +66,8 @@ class TestReservationTracker:
         t = ReservationTracker()
         p = _make_pending("__llm__", "res_llm")
         assert t.has_pending_llm is False
-        t.register_llm(p)
+        prev = t.register_llm(p)
+        assert prev is None
         assert t.has_pending_llm is True
         result = t.pop_llm()
         assert result is p
@@ -76,12 +77,14 @@ class TestReservationTracker:
         t = ReservationTracker()
         assert t.pop_llm() is None
 
-    def test_llm_overwrite(self) -> None:
+    def test_llm_overwrite_returns_previous(self) -> None:
         t = ReservationTracker()
         p1 = _make_pending("__llm__", "res_1")
         p2 = _make_pending("__llm__", "res_2")
-        t.register_llm(p1)
-        t.register_llm(p2)
+        prev1 = t.register_llm(p1)
+        assert prev1 is None
+        prev2 = t.register_llm(p2)
+        assert prev2 is p1
         result = t.pop_llm()
         assert result is p2
 

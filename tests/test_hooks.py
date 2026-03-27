@@ -504,6 +504,27 @@ class TestHeartbeat:
         task = h._start_heartbeat("res_test")
         assert task is None
 
+    def test_no_heartbeat_when_ttl_too_small(self, mock_client: AsyncMock) -> None:
+        h = _hooks(mock_client, ttl_ms=1999)
+        task = h._start_heartbeat("res_test")
+        assert task is None
+
+    async def test_llm_overwrite_releases_previous(
+        self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock
+    ) -> None:
+        mock_client.create_reservation.return_value = make_success_response(reservation_id="res_llm1")
+        mock_client.release_reservation.return_value = make_commit_response()
+        h = _hooks(mock_client, ttl_ms=0)
+
+        await h.on_llm_start(mock_context, mock_agent, None, [])
+
+        mock_client.create_reservation.return_value = make_success_response(reservation_id="res_llm2")
+        await h.on_llm_start(mock_context, mock_agent, None, [])
+
+        mock_client.release_reservation.assert_awaited_once()
+        args = mock_client.release_reservation.call_args[0]
+        assert args[0] == "res_llm1"
+
 
 # --- release_pending ---
 

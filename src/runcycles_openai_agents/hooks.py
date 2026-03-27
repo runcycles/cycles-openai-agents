@@ -127,8 +127,12 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
         return uuid.uuid4().hex
 
     def _start_heartbeat(self, reservation_id: str) -> asyncio.Task[None] | None:
-        """Spawn a background task that extends the reservation at half-TTL intervals."""
-        if self._ttl_ms <= 0:
+        """Spawn a background task that extends the reservation at half-TTL intervals.
+
+        Heartbeat is disabled when ``ttl_ms`` is too small (< 2000ms) because the
+        minimum interval of 1s would exceed the TTL window.
+        """
+        if self._ttl_ms < 2000:
             return None
         interval_s = max(self._ttl_ms / 2, 1000) / 1000.0
 
@@ -344,7 +348,10 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
             unit=self._llm_unit,
             heartbeat_task=self._start_heartbeat(reservation_id),
         )
-        self._tracker.register_llm(pending)
+        previous = self._tracker.register_llm(pending)
+        if previous is not None:
+            logger.warning("cycles: overwriting pending LLM reservation=%s", previous.reservation_id)
+            await self._release_reservation(previous, "overwritten_by_new_llm_call")
         logger.debug("cycles: llm_start reserved=%s agent=%s", reservation_id, agent.name)
 
     async def on_llm_end(

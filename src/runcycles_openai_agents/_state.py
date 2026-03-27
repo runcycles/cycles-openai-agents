@@ -56,15 +56,16 @@ class ReservationTracker:
     def pop_tool(self, tool_name: str) -> PendingReservation | None:
         """Remove and return the reservation for *tool_name*.
 
-        Tries the plain name first, then any suffixed variants.
+        Tries the plain name first, then any suffixed variants (oldest first).
+        All variants share one counter under the base *tool_name* — ``register_tool``
+        increments and ``_decrement_count`` decrements the same base key.
         """
         if tool_name in self._pending_tools:
             res = self._pending_tools.pop(tool_name)
             self._decrement_count(tool_name)
             return res
-        # Try suffixed keys (oldest first)
         for key in sorted(self._pending_tools):
-            if key == tool_name or key.startswith(f"{tool_name}#"):
+            if key.startswith(f"{tool_name}#"):
                 res = self._pending_tools.pop(key)
                 self._decrement_count(tool_name)
                 return res
@@ -77,9 +78,15 @@ class ReservationTracker:
         else:
             self._tool_counts[tool_name] = count - 1
 
-    def register_llm(self, reservation: PendingReservation) -> None:
-        """Store a pending LLM reservation."""
+    def register_llm(self, reservation: PendingReservation) -> PendingReservation | None:
+        """Store a pending LLM reservation.
+
+        Returns the previous pending reservation if one was overwritten, so the
+        caller can release it.
+        """
+        previous = self._pending_llm
         self._pending_llm = reservation
+        return previous
 
     def pop_llm(self) -> PendingReservation | None:
         """Remove and return the pending LLM reservation."""

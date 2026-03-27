@@ -1,4 +1,4 @@
-"""Tests for _defaults constants."""
+"""Tests for _defaults constants and package metadata."""
 
 from runcycles_openai_agents._defaults import (
     DEFAULT_ACTION_KIND_HANDOFF,
@@ -28,3 +28,10 @@ def test_action_kinds_are_strings() -> None:
     assert DEFAULT_ACTION_KIND_LLM == "llm.completion"
     assert DEFAULT_ACTION_KIND_HANDOFF == "agent.handoff"
     assert DEFAULT_ACTION_KIND_RUN == "agent.run"
+
+
+def test_package_version() -> None:
+    from runcycles_openai_agents import __version__
+
+    assert isinstance(__version__, str)
+    assert __version__

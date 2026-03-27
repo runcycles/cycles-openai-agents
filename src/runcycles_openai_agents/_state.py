@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 
@@ -18,6 +19,13 @@ class PendingReservation:
     estimate: int
     unit: Unit
     started_at: float = field(default_factory=time.monotonic)
+    heartbeat_task: asyncio.Task[None] | None = field(default=None, repr=False)
+
+    def cancel_heartbeat(self) -> None:
+        """Cancel the heartbeat task if running."""
+        if self.heartbeat_task is not None and not self.heartbeat_task.done():
+            self.heartbeat_task.cancel()
+            self.heartbeat_task = None
 
 
 class ReservationTracker:
@@ -78,6 +86,13 @@ class ReservationTracker:
         res = self._pending_llm
         self._pending_llm = None
         return res
+
+    def pop_all_tools(self) -> list[PendingReservation]:
+        """Remove and return all pending tool reservations."""
+        result = list(self._pending_tools.values())
+        self._pending_tools.clear()
+        self._tool_counts.clear()
+        return result
 
     @property
     def pending_tool_count(self) -> int:

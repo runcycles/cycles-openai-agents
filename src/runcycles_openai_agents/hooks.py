@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any, TypeVar
 
 from agents import Agent, RunContextWrapper, RunHooks, Tool
+from agents.items import TResponseInputItem
 from agents.lifecycle import AgentHookContext
 from agents.result import ModelResponse
 from runcycles import (
@@ -14,11 +16,14 @@ from runcycles import (
     Amount,
     AsyncCyclesClient,
     BudgetExceededError,
+    CommitOveragePolicy,
     CommitRequest,
     CyclesConfig,
     CyclesMetrics,
     EventCreateRequest,
+    ReleaseRequest,
     ReservationCreateRequest,
+    ReservationExtendRequest,
     Subject,
     Unit,
 )
@@ -71,7 +76,7 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
         # Behaviour
         fail_open: bool = True,
         ttl_ms: int = DEFAULT_TTL_MS,
-        overage_policy: str = "ALLOW_IF_AVAILABLE",
+        overage_policy: CommitOveragePolicy | str = CommitOveragePolicy.ALLOW_IF_AVAILABLE,
         dry_run: bool = False,
     ) -> None:
         if client is not None:
@@ -97,7 +102,9 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
         self._llm_unit = llm_unit
         self._fail_open = fail_open
         self._ttl_ms = ttl_ms
-        self._overage_policy = overage_policy
+        self._overage_policy = (
+            overage_policy if isinstance(overage_policy, CommitOveragePolicy) else CommitOveragePolicy(overage_policy)
+        )
         self._dry_run = dry_run
 
         self._tracker = ReservationTracker()
@@ -118,6 +125,48 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
     @staticmethod
     def _idem() -> str:
         return uuid.uuid4().hex
+
+    def _start_heartbeat(self, reservation_id: str) -> asyncio.Task[None] | None:
+        """Spawn a background task that extends the reservation at half-TTL intervals."""
+        if self._ttl_ms <= 0:
+            return None
+        interval_s = max(self._ttl_ms / 2, 1000) / 1000.0
+
+        async def _loop() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(interval_s)
+                    try:
+                        request = ReservationExtendRequest(
+                            idempotency_key=self._idem(),
+                            extend_by_ms=self._ttl_ms,
+                        )
+                        response = await self._client.extend_reservation(reservation_id, request)
+                        if response.is_success:
+                            logger.debug("cycles: heartbeat ok reservation=%s", reservation_id)
+                        else:
+                            logger.warning("cycles: heartbeat failed reservation=%s", reservation_id)
+                    except Exception:
+                        logger.warning("cycles: heartbeat error reservation=%s", reservation_id, exc_info=True)
+            except asyncio.CancelledError:
+                return
+
+        return asyncio.create_task(_loop())
+
+    async def _release_reservation(self, pending: PendingReservation, reason: str) -> None:
+        """Release a reservation and cancel its heartbeat."""
+        pending.cancel_heartbeat()
+        try:
+            request = ReleaseRequest(idempotency_key=self._idem(), reason=reason)
+            response = await self._client.release_reservation(pending.reservation_id, request)
+            if not response.is_success:
+                logger.warning(
+                    "cycles: release failed reservation=%s err=%s",
+                    pending.reservation_id,
+                    response.error_message,
+                )
+        except Exception:
+            logger.warning("cycles: release error reservation=%s", pending.reservation_id, exc_info=True)
 
     # --- hooks ---
 
@@ -165,9 +214,9 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
                 logger.warning("cycles: transport error on tool reserve, fail-open tool=%s", tool.name)
                 return
             raise BudgetExceededError(
+                f"Cycles budget service unavailable for tool={tool.name}",
                 status=-1,
                 error_code="TRANSPORT_ERROR",
-                message=f"Cycles budget service unavailable for tool={tool.name}",
             )
 
         if not response.is_success:
@@ -179,18 +228,18 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
                 )
                 return
             raise BudgetExceededError(
+                f"Cycles error for tool={tool.name}: {response.error_message}",
                 status=response.status,
                 error_code=response.get_body_attribute("error") or "UNKNOWN",
-                message=f"Cycles error for tool={tool.name}: {response.error_message}",
             )
 
         decision = response.get_body_attribute("decision")
         if decision == "DENY":
             reason = response.get_body_attribute("reason_code") or "budget_exceeded"
             raise BudgetExceededError(
+                f"Tool budget denied for {tool.name}: {reason}",
                 status=response.status,
                 error_code="BUDGET_EXCEEDED",
-                message=f"Tool budget denied for {tool.name}: {reason}",
             )
 
         reservation_id = response.get_body_attribute("reservation_id")
@@ -204,6 +253,7 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
             agent_name=agent.name,
             estimate=risk_cfg.risk_points,
             unit=risk_cfg.unit,
+            heartbeat_task=self._start_heartbeat(reservation_id),
         )
         self._tracker.register_tool(tool.name, pending)
         logger.debug("cycles: tool_start reserved=%s tool=%s", reservation_id, tool.name)
@@ -219,6 +269,7 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
         if pending is None:
             return
 
+        pending.cancel_heartbeat()
         commit = CommitRequest(
             idempotency_key=self._idem(),
             actual=Amount(unit=pending.unit, amount=pending.estimate),
@@ -237,7 +288,7 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
         context: RunContextWrapper[TContext],
         agent: Agent[TContext],
         system_prompt: str | None,
-        input_items: list[Any],
+        input_items: list[TResponseInputItem],
     ) -> None:
         request = ReservationCreateRequest(
             idempotency_key=self._idem(),
@@ -256,9 +307,9 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
                 logger.warning("cycles: transport error on LLM reserve, fail-open agent=%s", agent.name)
                 return
             raise BudgetExceededError(
+                "Cycles budget service unavailable",
                 status=-1,
                 error_code="TRANSPORT_ERROR",
-                message="Cycles budget service unavailable",
             )
 
         if not response.is_success:
@@ -266,18 +317,18 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
                 logger.warning("cycles: unexpected error on LLM reserve, fail-open err=%s", response.error_message)
                 return
             raise BudgetExceededError(
+                f"Cycles error: {response.error_message}",
                 status=response.status,
                 error_code=response.get_body_attribute("error") or "UNKNOWN",
-                message=f"Cycles error: {response.error_message}",
             )
 
         decision = response.get_body_attribute("decision")
         if decision == "DENY":
             reason = response.get_body_attribute("reason_code") or "budget_exceeded"
             raise BudgetExceededError(
+                f"LLM budget denied: {reason}",
                 status=response.status,
                 error_code="BUDGET_EXCEEDED",
-                message=f"LLM budget denied: {reason}",
             )
 
         reservation_id = response.get_body_attribute("reservation_id")
@@ -291,6 +342,7 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
             agent_name=agent.name,
             estimate=self._llm_estimate,
             unit=self._llm_unit,
+            heartbeat_task=self._start_heartbeat(reservation_id),
         )
         self._tracker.register_llm(pending)
         logger.debug("cycles: llm_start reserved=%s agent=%s", reservation_id, agent.name)
@@ -305,6 +357,7 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
         if pending is None:
             return
 
+        pending.cancel_heartbeat()
         tokens_in = getattr(response.usage, "input_tokens", 0) or 0
         tokens_out = getattr(response.usage, "output_tokens", 0) or 0
         actual_amount = pending.estimate
@@ -349,3 +402,13 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
                 to_agent.name,
                 response.error_message,
             )
+
+    async def release_pending(self, reason: str = "agent_run_failed") -> None:
+        """Release all pending reservations.  Call this when the agent run
+        fails and ``on_tool_end`` / ``on_llm_end`` won't fire.
+        """
+        pending_tools = self._tracker.pop_all_tools()
+        pending_llm = self._tracker.pop_llm()
+        all_pending = pending_tools + ([pending_llm] if pending_llm else [])
+        for pending in all_pending:
+            await self._release_reservation(pending, reason)

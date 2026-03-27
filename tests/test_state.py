@@ -88,3 +88,45 @@ class TestReservationTracker:
     def test_pending_reservation_has_started_at(self) -> None:
         p = _make_pending()
         assert p.started_at > 0
+
+    def test_pop_all_tools(self) -> None:
+        t = ReservationTracker()
+        p1 = _make_pending("a", "res_1")
+        p2 = _make_pending("b", "res_2")
+        t.register_tool("a", p1)
+        t.register_tool("b", p2)
+        result = t.pop_all_tools()
+        assert len(result) == 2
+        assert t.pending_tool_count == 0
+
+    def test_pop_all_tools_empty(self) -> None:
+        t = ReservationTracker()
+        assert t.pop_all_tools() == []
+
+    def test_cancel_heartbeat_noop_when_none(self) -> None:
+        p = _make_pending()
+        assert p.heartbeat_task is None
+        p.cancel_heartbeat()  # should not raise
+
+    def test_cancel_heartbeat_cancels_task(self) -> None:
+        import asyncio
+        from unittest.mock import MagicMock
+
+        p = _make_pending()
+        mock_task = MagicMock(spec=asyncio.Task)
+        mock_task.done.return_value = False
+        p.heartbeat_task = mock_task
+        p.cancel_heartbeat()
+        mock_task.cancel.assert_called_once()
+        assert p.heartbeat_task is None
+
+    def test_cancel_heartbeat_skips_done_task(self) -> None:
+        import asyncio
+        from unittest.mock import MagicMock
+
+        p = _make_pending()
+        mock_task = MagicMock(spec=asyncio.Task)
+        mock_task.done.return_value = True
+        p.heartbeat_task = mock_task
+        p.cancel_heartbeat()
+        mock_task.cancel.assert_not_called()

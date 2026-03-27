@@ -435,3 +435,134 @@ class TestSubject:
         s = h._subject(agent_name="override-agent", toolset_name="override-tool")
         assert s.agent == "override-agent"
         assert s.toolset == "override-tool"
+
+
+# --- Heartbeat ---
+
+
+class TestHeartbeat:
+    async def test_tool_reservation_gets_heartbeat(
+        self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
+    ) -> None:
+        mock_client.create_reservation.return_value = make_success_response()
+        mock_client.commit_reservation.return_value = make_commit_response()
+        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+
+        await h.on_tool_start(mock_context, mock_agent, mock_tool)
+        pending = h._tracker.pop_tool("test-tool")
+        assert pending is not None
+        assert pending.heartbeat_task is not None
+        pending.cancel_heartbeat()
+
+    async def test_llm_reservation_gets_heartbeat(
+        self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock
+    ) -> None:
+        mock_client.create_reservation.return_value = make_success_response(reservation_id="res_llm")
+        h = _hooks(mock_client)
+
+        await h.on_llm_start(mock_context, mock_agent, None, [])
+        pending = h._tracker.pop_llm()
+        assert pending is not None
+        assert pending.heartbeat_task is not None
+        pending.cancel_heartbeat()
+
+    async def test_tool_end_cancels_heartbeat(
+        self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
+    ) -> None:
+        mock_client.create_reservation.return_value = make_success_response()
+        mock_client.commit_reservation.return_value = make_commit_response()
+        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+
+        await h.on_tool_start(mock_context, mock_agent, mock_tool)
+        # Verify heartbeat is running
+        pending_key = list(h._tracker._pending_tools.keys())[0]
+        task = h._tracker._pending_tools[pending_key].heartbeat_task
+        assert task is not None
+
+        await h.on_tool_end(mock_context, mock_agent, mock_tool, "result")
+        assert task.cancelled() or task.cancelling()
+
+    async def test_llm_end_cancels_heartbeat(
+        self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock
+    ) -> None:
+        mock_client.create_reservation.return_value = make_success_response(reservation_id="res_llm")
+        mock_client.commit_reservation.return_value = make_commit_response()
+        h = _hooks(mock_client)
+
+        await h.on_llm_start(mock_context, mock_agent, None, [])
+        task = h._tracker._pending_llm.heartbeat_task  # type: ignore[union-attr]
+        assert task is not None
+
+        mock_response = MagicMock()
+        mock_response.usage.input_tokens = 10
+        mock_response.usage.output_tokens = 5
+        await h.on_llm_end(mock_context, mock_agent, mock_response)
+        assert task.cancelled() or task.cancelling()
+
+    def test_no_heartbeat_when_ttl_zero(self, mock_client: AsyncMock) -> None:
+        h = _hooks(mock_client, ttl_ms=0)
+        task = h._start_heartbeat("res_test")
+        assert task is None
+
+
+# --- release_pending ---
+
+
+class TestReleasePending:
+    async def test_releases_pending_tools_and_llm(
+        self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
+    ) -> None:
+        mock_client.create_reservation.return_value = make_success_response()
+        mock_client.release_reservation.return_value = make_commit_response()
+        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+
+        await h.on_tool_start(mock_context, mock_agent, mock_tool)
+        await h.on_llm_start(mock_context, mock_agent, None, [])
+
+        await h.release_pending("test_failure")
+
+        assert mock_client.release_reservation.await_count == 2
+        assert h._tracker.pending_tool_count == 0
+        assert h._tracker.has_pending_llm is False
+
+    async def test_release_pending_when_empty(self, mock_client: AsyncMock) -> None:
+        h = _hooks(mock_client)
+        await h.release_pending()
+        mock_client.release_reservation.assert_not_awaited()
+
+    async def test_release_failure_does_not_raise(
+        self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
+    ) -> None:
+        mock_client.create_reservation.return_value = make_success_response()
+        mock_client.release_reservation.return_value = make_http_error(500)
+        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+
+        await h.on_tool_start(mock_context, mock_agent, mock_tool)
+        await h.release_pending()  # should not raise
+
+    async def test_release_exception_does_not_raise(
+        self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
+    ) -> None:
+        mock_client.create_reservation.return_value = make_success_response()
+        mock_client.release_reservation.side_effect = ConnectionError("down")
+        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+
+        await h.on_tool_start(mock_context, mock_agent, mock_tool)
+        await h.release_pending()  # should not raise
+
+
+# --- overage_policy type ---
+
+
+class TestOveragePolicy:
+    def test_string_overage_policy(self, mock_client: AsyncMock) -> None:
+        from runcycles import CommitOveragePolicy
+
+        h = _hooks(mock_client, overage_policy="REJECT")
+        assert h._overage_policy == CommitOveragePolicy.REJECT
+
+    def test_enum_overage_policy(self, mock_client: AsyncMock) -> None:
+        from runcycles import CommitOveragePolicy
+
+        h = _hooks(mock_client, overage_policy=CommitOveragePolicy.ALLOW_WITH_OVERDRAFT)
+        assert h._overage_policy == CommitOveragePolicy.ALLOW_WITH_OVERDRAFT

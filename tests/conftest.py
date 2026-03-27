@@ -18,10 +18,8 @@ def mock_client() -> AsyncMock:
 
 @pytest.fixture()
 def mock_context() -> MagicMock:
-    """Return a mock ``RunContextWrapper`` with reject_tool / approve_tool."""
+    """Return a mock ``RunContextWrapper``."""
     ctx = MagicMock()
-    ctx.reject_tool = MagicMock()
-    ctx.approve_tool = MagicMock()
     ctx.usage = MagicMock()
     return ctx
 

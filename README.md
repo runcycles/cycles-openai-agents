@@ -49,7 +49,7 @@ A `RunHooks` implementation that automatically governs the entire agent run:
 
 | Hook | Cycles API Call | Blocking |
 |------|----------------|----------|
-| `on_tool_start` | `create_reservation` (risk points) | `context.reject_tool()` on DENY |
+| `on_tool_start` | `create_reservation` (risk points) | Raises on DENY |
 | `on_tool_end` | `commit_reservation` | No |
 | `on_llm_start` | `create_reservation` (token/USD budget) | Raises on DENY |
 | `on_llm_end` | `commit_reservation` (actual tokens) | No |

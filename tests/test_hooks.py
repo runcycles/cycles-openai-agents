@@ -72,20 +72,16 @@ class TestOnToolStart:
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
 
         mock_client.create_reservation.assert_awaited_once()
-        mock_context.reject_tool.assert_not_called()
         assert h._tracker.pending_tool_count == 1
 
-    async def test_deny_calls_reject_tool(
+    async def test_deny_raises_budget_exceeded(
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
     ) -> None:
         mock_client.create_reservation.return_value = make_deny_response()
         h = _hooks(mock_client, tool_risk={"test-tool": 10})
 
-        await h.on_tool_start(mock_context, mock_agent, mock_tool)
-
-        mock_context.reject_tool.assert_called_once()
-        msg = mock_context.reject_tool.call_args[0][0].lower()
-        assert "denied" in msg or "budget" in msg
+        with pytest.raises(BudgetExceededError):
+            await h.on_tool_start(mock_context, mock_agent, mock_tool)
 
     async def test_transport_error_fail_open(
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
@@ -95,17 +91,14 @@ class TestOnToolStart:
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
 
-        mock_context.reject_tool.assert_not_called()
-
     async def test_transport_error_fail_closed(
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
     ) -> None:
         mock_client.create_reservation.return_value = make_transport_error()
         h = _hooks(mock_client, tool_risk={"test-tool": 10}, fail_open=False)
 
-        await h.on_tool_start(mock_context, mock_agent, mock_tool)
-
-        mock_context.reject_tool.assert_called_once()
+        with pytest.raises(BudgetExceededError):
+            await h.on_tool_start(mock_context, mock_agent, mock_tool)
 
     async def test_zero_cost_tool_skips_reservation(
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
@@ -116,7 +109,6 @@ class TestOnToolStart:
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
 
         mock_client.create_reservation.assert_not_awaited()
-        mock_context.reject_tool.assert_not_called()
 
     async def test_http_error_fail_open(
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
@@ -126,17 +118,14 @@ class TestOnToolStart:
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
 
-        mock_context.reject_tool.assert_not_called()
-
     async def test_http_error_fail_closed(
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
     ) -> None:
         mock_client.create_reservation.return_value = make_http_error(500)
         h = _hooks(mock_client, tool_risk={"test-tool": 10}, fail_open=False)
 
-        await h.on_tool_start(mock_context, mock_agent, mock_tool)
-
-        mock_context.reject_tool.assert_called_once()
+        with pytest.raises(BudgetExceededError):
+            await h.on_tool_start(mock_context, mock_agent, mock_tool)
 
     async def test_dry_run_passes_flag(
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock

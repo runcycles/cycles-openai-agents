@@ -164,8 +164,11 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
             if self._fail_open:
                 logger.warning("cycles: transport error on tool reserve, fail-open tool=%s", tool.name)
                 return
-            context.reject_tool("Cycles budget service unavailable")
-            return
+            raise BudgetExceededError(
+                status=-1,
+                error_code="TRANSPORT_ERROR",
+                message=f"Cycles budget service unavailable for tool={tool.name}",
+            )
 
         if not response.is_success:
             if self._fail_open:
@@ -175,14 +178,20 @@ class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
                     response.error_message,
                 )
                 return
-            context.reject_tool(f"Cycles error: {response.error_message}")
-            return
+            raise BudgetExceededError(
+                status=response.status,
+                error_code=response.get_body_attribute("error") or "UNKNOWN",
+                message=f"Cycles error for tool={tool.name}: {response.error_message}",
+            )
 
         decision = response.get_body_attribute("decision")
         if decision == "DENY":
             reason = response.get_body_attribute("reason_code") or "budget_exceeded"
-            context.reject_tool(f"Budget denied: {reason}")
-            return
+            raise BudgetExceededError(
+                status=response.status,
+                error_code="BUDGET_EXCEEDED",
+                message=f"Tool budget denied for {tool.name}: {reason}",
+            )
 
         reservation_id = response.get_body_attribute("reservation_id")
         if reservation_id is None:

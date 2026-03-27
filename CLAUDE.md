@@ -11,8 +11,8 @@
 - maintain at least 95% or higher test coverage for all code repos
 
 # Build & Test
-- Install: `npm install`
-- Build: `npm run build`
-- Test: `npm test`
-- Test with coverage: `npm run test:coverage`
-- Type check: `npm run typecheck`
+- Install: `pip install -e ".[dev]"`
+- Test: `pytest`
+- Test with coverage: `pytest --cov=runcycles_openai_agents`
+- Lint & format: `ruff check` / `ruff format`
+- Type check: `python -m mypy src/runcycles_openai_agents`

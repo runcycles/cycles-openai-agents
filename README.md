@@ -65,6 +65,32 @@ agent = Agent(
 result = await Runner.run(agent, input="...", hooks=hooks)
 ```
 
+### Error Handling
+
+If `Runner.run()` raises, pending reservations stay locked until TTL expires. Call `release_pending()` to free them immediately:
+
+```python
+hooks = CyclesRunHooks(tenant="acme-corp", app="support-platform")
+
+try:
+    result = await Runner.run(agent, input="...", hooks=hooks)
+except Exception:
+    await hooks.release_pending("agent_run_failed")
+    raise
+```
+
+When budget is denied, the hooks raise `BudgetExceededError`:
+
+```python
+from runcycles import BudgetExceededError
+
+try:
+    result = await Runner.run(agent, input="...", hooks=hooks)
+except BudgetExceededError as e:
+    print(f"Budget denied: {e}")
+    # Agent stopped — no further tokens consumed
+```
+
 ## Features
 
 ### CyclesRunHooks

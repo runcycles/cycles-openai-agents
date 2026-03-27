@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -508,6 +509,81 @@ class TestHeartbeat:
         h = _hooks(mock_client, ttl_ms=1999)
         task = h._start_heartbeat("res_test")
         assert task is None
+
+    async def test_heartbeat_fires_and_extends(self, mock_client: AsyncMock) -> None:
+        mock_client.extend_reservation.return_value = make_success_response()
+        h = _hooks(mock_client, ttl_ms=2000)
+
+        # Patch sleep to return immediately so the heartbeat fires
+        call_count = 0
+        original_sleep = asyncio.sleep
+
+        async def fast_sleep(seconds: float) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                raise asyncio.CancelledError  # stop after one real iteration
+            await original_sleep(0)
+
+        with patch("runcycles_openai_agents.hooks.asyncio.sleep", side_effect=fast_sleep):
+            task = h._start_heartbeat("res_hb")
+            assert task is not None
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        mock_client.extend_reservation.assert_awaited_once()
+        req = mock_client.extend_reservation.call_args[0][1]
+        assert req.extend_by_ms == 2000
+
+    async def test_heartbeat_handles_extend_failure(self, mock_client: AsyncMock) -> None:
+        mock_client.extend_reservation.return_value = make_http_error(500)
+        h = _hooks(mock_client, ttl_ms=2000)
+
+        call_count = 0
+        original_sleep = asyncio.sleep
+
+        async def fast_sleep(seconds: float) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                raise asyncio.CancelledError
+            await original_sleep(0)
+
+        with patch("runcycles_openai_agents.hooks.asyncio.sleep", side_effect=fast_sleep):
+            task = h._start_heartbeat("res_hb")
+            assert task is not None
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        mock_client.extend_reservation.assert_awaited_once()
+
+    async def test_heartbeat_handles_extend_exception(self, mock_client: AsyncMock) -> None:
+        mock_client.extend_reservation.side_effect = ConnectionError("down")
+        h = _hooks(mock_client, ttl_ms=2000)
+
+        call_count = 0
+        original_sleep = asyncio.sleep
+
+        async def fast_sleep(seconds: float) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                raise asyncio.CancelledError
+            await original_sleep(0)
+
+        with patch("runcycles_openai_agents.hooks.asyncio.sleep", side_effect=fast_sleep):
+            task = h._start_heartbeat("res_hb")
+            assert task is not None
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        mock_client.extend_reservation.assert_awaited_once()
 
     async def test_llm_overwrite_releases_previous(
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock

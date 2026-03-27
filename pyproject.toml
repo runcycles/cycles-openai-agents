@@ -9,10 +9,32 @@ description = "Cycles budget governance for OpenAI Agents SDK"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
+authors = [
+    { name = "Cycles", email = "support@runcycles.io" },
+]
+keywords = ["cycles", "budget", "governance", "openai", "agents", "llm", "cost-control"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
 dependencies = [
     "runcycles>=0.2.0",
     "openai-agents>=0.1.0",
 ]
+
+[project.urls]
+Homepage = "https://runcycles.io"
+Documentation = "https://runcycles.io"
+Repository = "https://github.com/runcycles/cycles-openai-agents"
+Issues = "https://github.com/runcycles/cycles-openai-agents/issues"
+Changelog = "https://github.com/runcycles/cycles-openai-agents/releases"
 
 [project.optional-dependencies]
 dev = [

@@ -7,10 +7,8 @@ import logging
 import uuid
 from typing import Any, TypeVar
 
-from agents import Agent, RunContextWrapper, RunHooks, Tool
+from agents import Agent, AgentHookContext, ModelResponse, RunContextWrapper, RunHooks, Tool
 from agents.items import TResponseInputItem
-from agents.lifecycle import AgentHookContext
-from agents.result import ModelResponse
 from runcycles import (
     Action,
     Amount,
@@ -42,7 +40,7 @@ logger = logging.getLogger(__name__)
 TContext = TypeVar("TContext")
 
 
-class CyclesRunHooks(RunHooks[TContext]):  # type: ignore[misc]
+class CyclesRunHooks(RunHooks[TContext]):
     """Plugs Cycles budget governance into every tool call, LLM call, and
     handoff in an OpenAI Agents SDK run.
 

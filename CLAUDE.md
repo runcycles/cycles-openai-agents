@@ -15,4 +15,4 @@
 - Test: `pytest`
 - Test with coverage: `pytest --cov=runcycles_openai_agents`
 - Lint & format: `ruff check` / `ruff format`
-- Type check: `mypy src/runcycles_openai_agents`
+- Type check: `python -m mypy src/runcycles_openai_agents`

@@ -2,9 +2,33 @@
 
 Cycles budget governance for the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python).
 
-## Overview
+## Why
 
-`runcycles-openai-agents` plugs [Cycles](https://runcycles.com) budget governance into the OpenAI Agents SDK's native hook and guardrail system. Every tool call, LLM call, and agent handoff is automatically governed — no per-function decoration required.
+The OpenAI Agents SDK gives you hooks and guardrails for content safety, but **nothing for cost control or action authority**. Without budget governance:
+
+- A retry loop burns through $47 of API calls before anyone notices.
+- An agent with a `send_email` tool sends 200 emails in a single run because nothing limits it.
+- You can't give Tenant A a $10/day budget and Tenant B a $100/day budget — every tenant gets unlimited access.
+- There's no audit trail showing which agent called which tool, how many tokens it used, or what it cost.
+
+**This plugin fixes all of that with one line:**
+
+```python
+result = await Runner.run(agent, input="...", hooks=CyclesRunHooks(tenant="acme"))
+```
+
+Every LLM call and every tool call in the entire agent run — including handoffs to sub-agents — automatically reserves budget before execution and commits actual usage after. If the budget is exhausted, the agent stops. No per-function decoration. No code changes to your tools.
+
+## What It Does
+
+| Problem | How This Solves It |
+|---------|-------------------|
+| Runaway LLM costs | Every LLM call reserves budget before running. DENY = agent stops. |
+| Uncontrolled tool actions | Tool risk map assigns point costs (`send_email: 50`, `search: 0`). High-risk tools exhaust budget faster. |
+| No per-tenant limits | Pass `tenant="acme"` — Cycles enforces per-tenant budgets server-side. |
+| No pre-run check | `cycles_budget_guardrail` calls `/v1/decide` before the agent starts. Zero tokens consumed on DENY. |
+| No audit trail | Every reservation, commit, and handoff is recorded in the Cycles ledger. |
+| Agent runs forever | TTL heartbeat auto-extends reservations. If the agent dies, reservations expire and budget is released. |
 
 ## Installation
 

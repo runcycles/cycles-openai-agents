@@ -1,6 +1,11 @@
-# runcycles-openai-agents
+[![PyPI](https://img.shields.io/pypi/v/runcycles-openai-agents)](https://pypi.org/project/runcycles-openai-agents/)
+[![CI](https://github.com/runcycles/cycles-openai-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/runcycles/cycles-openai-agents/actions)
+[![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](https://github.com/runcycles/cycles-openai-agents)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
-Cycles budget governance for the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python).
+# Cycles OpenAI Agents SDK Integration
+
+Budget governance for the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python), powered by [Cycles](https://runcycles.io).
 
 ## Why
 
@@ -36,6 +41,8 @@ Every LLM call and every tool call in the entire agent run — including handoff
 pip install runcycles-openai-agents
 ```
 
+> **Need an API key?** API keys are created via the Cycles Admin Server. See the [deployment guide](https://runcycles.io/quickstart/deploying-the-full-cycles-stack#step-3-create-an-api-key) to create one.
+
 ## Quick Start
 
 ```python
@@ -65,7 +72,21 @@ agent = Agent(
 result = await Runner.run(agent, input="...", hooks=hooks)
 ```
 
-### Error Handling
+### Hook lifecycle
+
+The hooks plug into the SDK's native `RunHooks` interface and govern the **entire agent run** automatically:
+
+| Hook | Cycles API Call | Blocking | Detail |
+|------|----------------|----------|--------|
+| `on_tool_start` | `create_reservation` (risk points) | Raises on DENY | Budget reserved based on tool risk map |
+| `on_tool_end` | `commit_reservation` | No | Actual risk points committed |
+| `on_llm_start` | `create_reservation` (token/USD budget) | Raises on DENY | Budget reserved before each LLM call |
+| `on_llm_end` | `commit_reservation` (actual tokens) | No | Real token count from `response.usage` committed |
+| `on_handoff` | `create_event` (audit trail) | No | Handoff recorded in Cycles ledger |
+
+All raised exceptions from budget denial trigger `BudgetExceededError`. See [Error Handling Patterns in Python](https://runcycles.io/how-to/error-handling-patterns-in-python) for details.
+
+## Error handling
 
 If `Runner.run()` raises, pending reservations stay locked until TTL expires. Call `release_pending()` to free them immediately:
 
@@ -91,56 +112,64 @@ except BudgetExceededError as e:
     # Agent stopped — no further tokens consumed
 ```
 
-## Features
+## Guardrail (pre-run check)
 
-### CyclesRunHooks
+`cycles_budget_guardrail` returns an `InputGuardrail` that calls `/v1/decide` before the agent starts. If the tenant is suspended or budget is exhausted, the guardrail trips and the agent never runs — zero tokens consumed:
 
-A `RunHooks` implementation that automatically governs the entire agent run:
+```python
+from runcycles_openai_agents import cycles_budget_guardrail
 
-| Hook | Cycles API Call | Blocking |
-|------|----------------|----------|
-| `on_tool_start` | `create_reservation` (risk points) | Raises on DENY |
-| `on_tool_end` | `commit_reservation` | No |
-| `on_llm_start` | `create_reservation` (token/USD budget) | Raises on DENY |
-| `on_llm_end` | `commit_reservation` (actual tokens) | No |
-| `on_handoff` | `create_event` (audit trail) | No |
+guardrail = cycles_budget_guardrail(
+    tenant="acme-corp",
+    estimate=5_000_000,      # expected total run cost
+    unit=Unit.USD_MICROCENTS,
+    fail_open=True,          # allow if Cycles server is down
+)
 
-### cycles_budget_guardrail
+agent = Agent(name="bot", input_guardrails=[guardrail])
+```
 
-An `InputGuardrail` that calls `/v1/decide` before the agent starts. If the tenant is suspended or budget is exhausted, the guardrail trips and the agent never runs — zero tokens consumed.
+## Tool risk mapping
 
-### ToolRiskMap
-
-Define a risk policy once. New tools get a default risk level automatically:
+Define a risk policy once. New tools added to the agent get a default risk level automatically:
 
 ```python
 from runcycles_openai_agents import ToolRiskMap, ToolRiskConfig
 
-risk_map = ToolRiskMap(
-    mapping={
-        "send_email": 50,
-        "update_crm": ToolRiskConfig(risk_points=10, action_kind="tool.crm.update"),
-        "search_knowledge": 0,
-    },
-    default_risk=1,
+hooks = CyclesRunHooks(
+    tenant="acme-corp",
+    tool_risk=ToolRiskMap(
+        mapping={
+            "send_email": 50,
+            "update_crm": ToolRiskConfig(risk_points=10, action_kind="tool.crm.update"),
+            "search_knowledge": 0,  # zero-cost — no reservation, no API call
+        },
+        default_risk=1,  # any unmapped tool costs 1 point
+    ),
 )
 ```
 
 ## Configuration
 
-### Environment Variables
+### From environment variables
 
-Set `CYCLES_BASE_URL` and `CYCLES_API_KEY` for zero-config setup:
+```python
+from runcycles_openai_agents import CyclesRunHooks
+
+# Reads CYCLES_BASE_URL, CYCLES_API_KEY automatically
+hooks = CyclesRunHooks(tenant="acme-corp")
+```
 
 ```bash
 export CYCLES_BASE_URL=http://localhost:7878
 export CYCLES_API_KEY=cyc_live_...
 ```
 
-### Explicit Config
+### Explicit client
 
 ```python
 from runcycles import CyclesConfig, AsyncCyclesClient
+from runcycles_openai_agents import CyclesRunHooks
 
 config = CyclesConfig(base_url="http://localhost:7878", api_key="cyc_live_...")
 client = AsyncCyclesClient(config)
@@ -148,7 +177,7 @@ client = AsyncCyclesClient(config)
 hooks = CyclesRunHooks(client=client, tenant="acme-corp")
 ```
 
-### Fail-Open / Fail-Closed
+### Fail-open / fail-closed
 
 By default, if the Cycles server is unreachable the agent continues (`fail_open=True`). Set `fail_open=False` to enforce strict budget governance:
 
@@ -156,14 +185,83 @@ By default, if the Cycles server is unreachable the agent continues (`fail_open=
 hooks = CyclesRunHooks(tenant="acme", fail_open=False)
 ```
 
+### All options
+
+```python
+CyclesRunHooks(
+    client=None,                # AsyncCyclesClient (or auto-created from config/env)
+    config=None,                # CyclesConfig (creates client if no client given)
+    tenant="acme-corp",         # Subject.tenant
+    workspace="prod",           # Subject.workspace
+    app="support-platform",     # Subject.app
+    workflow="case-resolution", # Subject.workflow
+    agent="case-resolver",      # Subject.agent (overridden by actual agent name)
+    toolset=None,               # Subject.toolset (overridden by tool name)
+    tool_risk={"email": 50},    # dict or ToolRiskMap
+    default_tool_risk=1,        # risk points for unmapped tools
+    llm_estimate=500_000,       # per-LLM-call estimate (default ~$0.005)
+    llm_unit=Unit.USD_MICROCENTS,
+    fail_open=True,             # allow execution if Cycles is down
+    ttl_ms=60_000,              # reservation TTL (heartbeat extends at half-interval)
+    overage_policy=CommitOveragePolicy.ALLOW_IF_AVAILABLE,
+    dry_run=False,              # shadow mode — no budget consumed
+)
+```
+
+## Features
+
+- **Framework-native**: Plugs into the SDK's `RunHooks` interface — not function-level decoration
+- **Policy-driven**: Define tool risk once in a map, not per-function
+- **LLM governance**: Every LLM call reserves and commits with real token metrics
+- **Pre-run guardrail**: `/v1/decide` check before agent starts — zero tokens on DENY
+- **Handoff-aware**: Agent handoffs recorded as audit events in the Cycles ledger
+- **Automatic heartbeat**: TTL extension keeps reservations alive during long operations
+- **Fail-safe cleanup**: `release_pending()` frees locked budget when agent runs fail
+- **Fail-open by default**: Agent continues if Cycles server is unreachable
+- **Environment config**: `CYCLES_BASE_URL` + `CYCLES_API_KEY` for zero-config setup
+- **Typed exceptions**: `BudgetExceededError` for precise error handling
+
+## Examples
+
+The [`examples/`](examples/) directory contains runnable integration examples:
+
+| Example | Description |
+|---------|-------------|
+| [basic_budget.py](examples/basic_budget.py) | LLM token budget enforcement |
+| [tool_governance.py](examples/tool_governance.py) | Tool risk mapping — high-risk tools cost more, read-only tools are free |
+| [multi_agent.py](examples/multi_agent.py) | Multi-agent handoff with shared budget and pre-run guardrail |
+
+See [examples/README.md](examples/README.md) for setup instructions.
+
 ## Development
 
 ```bash
 pip install -e ".[dev]"
-pytest --cov
+
+# Lint
 ruff check .
+
+# Type check (strict mode)
 mypy src/runcycles_openai_agents
+
+# Run tests with coverage (95% threshold enforced in CI)
+pytest --cov
 ```
+
+CI runs all three checks on Python 3.10 and 3.12 for every push and pull request.
+
+## Documentation
+
+- [Cycles Documentation](https://runcycles.io) — full docs site
+- [Python Client](https://pypi.org/project/runcycles/) — the underlying `runcycles` client
+- [Cycles Protocol](https://runcycles.io/protocol/how-reserve-commit-works-in-cycles) — how reserve-commit works
+- [Error Handling Patterns](https://runcycles.io/how-to/error-handling-patterns-in-python) — handling budget errors
+
+## Requirements
+
+- Python 3.10+
+- [runcycles](https://pypi.org/project/runcycles/) >= 0.2.0
+- [openai-agents](https://pypi.org/project/openai-agents/) >= 0.1.0
 
 ## License
 

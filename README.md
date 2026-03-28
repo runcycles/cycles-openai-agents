@@ -14,8 +14,10 @@ Before you begin, make sure you have:
 1. **Python 3.10+**
 2. **An OpenAI API key** — required by the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) to call LLMs
 3. **A running Cycles server** — see the [deployment guide](https://runcycles.io/quickstart/deploying-the-full-cycles-stack) to set one up
-4. **A Cycles API key** — created via the Cycles Admin Server ([instructions](https://runcycles.io/quickstart/deploying-the-full-cycles-stack#step-3-create-an-api-key))
-5. **A configured budget** — at least one tenant with an active budget in your Cycles server
+4. **A Cycles API key** — see [API key management](https://runcycles.io/how-to/api-key-management-in-cycles)
+5. **A tenant and budget** — see [tenant management](https://runcycles.io/how-to/tenant-creation-and-management-in-cycles) and [budget allocation](https://runcycles.io/how-to/budget-allocation-and-management-in-cycles)
+
+> **New to Cycles?** The [end-to-end tutorial](https://runcycles.io/quickstart/end-to-end-tutorial) walks through the full setup — from deploying the server to making your first budget-guarded API call — in about 10 minutes.
 
 ## Why
 

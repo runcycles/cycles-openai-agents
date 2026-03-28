@@ -7,6 +7,16 @@
 
 Budget governance for the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python), powered by [Cycles](https://runcycles.io).
 
+## Prerequisites
+
+Before you begin, make sure you have:
+
+1. **Python 3.10+**
+2. **An OpenAI API key** — required by the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) to call LLMs
+3. **A running Cycles server** — see the [deployment guide](https://runcycles.io/quickstart/deploying-the-full-cycles-stack) to set one up
+4. **A Cycles API key** — created via the Cycles Admin Server ([instructions](https://runcycles.io/quickstart/deploying-the-full-cycles-stack#step-3-create-an-api-key))
+5. **A configured budget** — at least one tenant with an active budget in your Cycles server
+
 ## Why
 
 The OpenAI Agents SDK gives you hooks and guardrails for content safety, but **nothing for cost control or action authority**. Without budget governance:
@@ -41,7 +51,18 @@ Every LLM call and every tool call in the entire agent run — including handoff
 pip install runcycles-openai-agents
 ```
 
-> **Need an API key?** API keys are created via the Cycles Admin Server. See the [deployment guide](https://runcycles.io/quickstart/deploying-the-full-cycles-stack#step-3-create-an-api-key) to create one.
+## Setup
+
+Set the following environment variables before running your agent:
+
+```bash
+# Required — OpenAI Agents SDK needs this to call LLMs
+export OPENAI_API_KEY=sk-...
+
+# Required — tells the plugin where your Cycles server is
+export CYCLES_BASE_URL=http://localhost:7878
+export CYCLES_API_KEY=cyc_live_...
+```
 
 ## Quick Start
 
@@ -151,20 +172,6 @@ hooks = CyclesRunHooks(
 
 ## Configuration
 
-### From environment variables
-
-```python
-from runcycles_openai_agents import CyclesRunHooks
-
-# Reads CYCLES_BASE_URL, CYCLES_API_KEY automatically
-hooks = CyclesRunHooks(tenant="acme-corp")
-```
-
-```bash
-export CYCLES_BASE_URL=http://localhost:7878
-export CYCLES_API_KEY=cyc_live_...
-```
-
 ### Explicit client
 
 ```python
@@ -256,12 +263,6 @@ CI runs all three checks on Python 3.10 and 3.12 for every push and pull request
 - [Python Client](https://pypi.org/project/runcycles/) — the underlying `runcycles` client
 - [Cycles Protocol](https://runcycles.io/protocol/how-reserve-commit-works-in-cycles) — how reserve-commit works
 - [Error Handling Patterns](https://runcycles.io/how-to/error-handling-patterns-in-python) — handling budget errors
-
-## Requirements
-
-- Python 3.10+
-- [runcycles](https://pypi.org/project/runcycles/) >= 0.2.0
-- [openai-agents](https://pypi.org/project/openai-agents/) >= 0.1.0
 
 ## License
 

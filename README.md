@@ -1,4 +1,5 @@
 [![PyPI](https://img.shields.io/pypi/v/runcycles-openai-agents?v=1)](https://pypi.org/project/runcycles-openai-agents/)
+[![PyPI Downloads](https://img.shields.io/pypi/dm/runcycles-openai-agents)](https://pypi.org/project/runcycles-openai-agents/)
 [![CI](https://github.com/runcycles/cycles-openai-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/runcycles/cycles-openai-agents/actions)
 [![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](https://github.com/runcycles/cycles-openai-agents)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)

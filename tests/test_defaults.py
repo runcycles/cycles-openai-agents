@@ -6,7 +6,7 @@ from runcycles_openai_agents._defaults import (
     DEFAULT_ACTION_KIND_RUN,
     DEFAULT_ACTION_KIND_TOOL,
     DEFAULT_LLM_ESTIMATE,
-    DEFAULT_TOOL_RISK,
+    DEFAULT_TOOL_ESTIMATE,
     DEFAULT_TTL_MS,
 )
 
@@ -15,8 +15,8 @@ def test_default_llm_estimate() -> None:
     assert DEFAULT_LLM_ESTIMATE == 500_000
 
 
-def test_default_tool_risk() -> None:
-    assert DEFAULT_TOOL_RISK == 1
+def test_default_tool_estimate() -> None:
+    assert DEFAULT_TOOL_ESTIMATE == 1
 
 
 def test_default_ttl_ms() -> None:

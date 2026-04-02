@@ -10,7 +10,7 @@ import pytest
 from runcycles import BudgetExceededError, Unit
 
 from runcycles_openai_agents.hooks import CyclesRunHooks
-from runcycles_openai_agents.risk_map import ToolRiskMap
+from runcycles_openai_agents.tool_estimate_map import ToolEstimateMap
 
 from .conftest import (
     make_commit_response,
@@ -50,14 +50,14 @@ class TestConstructor:
         CyclesRunHooks(tenant="t")
         mock_from_env.assert_called_once()
 
-    def test_risk_map_from_dict(self, mock_client: AsyncMock) -> None:
-        h = _hooks(mock_client, tool_risk={"email": 50})
-        assert not h._risk_map.is_zero_cost("email")
+    def test_estimate_map_from_dict(self, mock_client: AsyncMock) -> None:
+        h = _hooks(mock_client, tool_estimates={"email": 50})
+        assert not h._tool_estimate_map.is_zero_estimate("email")
 
-    def test_risk_map_from_instance(self, mock_client: AsyncMock) -> None:
-        rm = ToolRiskMap({"email": 50})
-        h = _hooks(mock_client, tool_risk=rm)
-        assert h._risk_map is rm
+    def test_estimate_map_from_instance(self, mock_client: AsyncMock) -> None:
+        rm = ToolEstimateMap({"email": 50})
+        h = _hooks(mock_client, tool_estimates=rm)
+        assert h._tool_estimate_map is rm
 
 
 # --- on_tool_start ---
@@ -68,7 +68,7 @@ class TestOnToolStart:
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
     ) -> None:
         mock_client.create_reservation.return_value = make_success_response()
-        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10})
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
 
@@ -79,7 +79,7 @@ class TestOnToolStart:
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
     ) -> None:
         mock_client.create_reservation.return_value = make_deny_response()
-        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10})
 
         with pytest.raises(BudgetExceededError):
             await h.on_tool_start(mock_context, mock_agent, mock_tool)
@@ -88,7 +88,7 @@ class TestOnToolStart:
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
     ) -> None:
         mock_client.create_reservation.return_value = make_transport_error()
-        h = _hooks(mock_client, tool_risk={"test-tool": 10}, fail_open=True)
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10}, fail_open=True)
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
 
@@ -96,16 +96,16 @@ class TestOnToolStart:
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
     ) -> None:
         mock_client.create_reservation.return_value = make_transport_error()
-        h = _hooks(mock_client, tool_risk={"test-tool": 10}, fail_open=False)
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10}, fail_open=False)
 
         with pytest.raises(BudgetExceededError):
             await h.on_tool_start(mock_context, mock_agent, mock_tool)
 
-    async def test_zero_cost_tool_skips_reservation(
+    async def test_zero_estimate_tool_skips_reservation(
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
     ) -> None:
         mock_tool.name = "free-search"
-        h = _hooks(mock_client, tool_risk={"free-search": 0})
+        h = _hooks(mock_client, tool_estimates={"free-search": 0})
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
 
@@ -115,7 +115,7 @@ class TestOnToolStart:
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
     ) -> None:
         mock_client.create_reservation.return_value = make_http_error(500)
-        h = _hooks(mock_client, tool_risk={"test-tool": 10}, fail_open=True)
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10}, fail_open=True)
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
 
@@ -123,7 +123,7 @@ class TestOnToolStart:
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
     ) -> None:
         mock_client.create_reservation.return_value = make_http_error(500)
-        h = _hooks(mock_client, tool_risk={"test-tool": 10}, fail_open=False)
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10}, fail_open=False)
 
         with pytest.raises(BudgetExceededError):
             await h.on_tool_start(mock_context, mock_agent, mock_tool)
@@ -132,7 +132,7 @@ class TestOnToolStart:
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock
     ) -> None:
         mock_client.create_reservation.return_value = make_success_response()
-        h = _hooks(mock_client, tool_risk={"test-tool": 10}, dry_run=True)
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10}, dry_run=True)
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
 
@@ -145,7 +145,7 @@ class TestOnToolStart:
         resp = make_success_response(reservation_id=None)  # type: ignore[arg-type]
         resp.body["reservation_id"] = None
         mock_client.create_reservation.return_value = resp
-        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10})
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
 
@@ -161,7 +161,7 @@ class TestOnToolEnd:
     ) -> None:
         mock_client.create_reservation.return_value = make_success_response(reservation_id="res_abc")
         mock_client.commit_reservation.return_value = make_commit_response()
-        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10})
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
         await h.on_tool_end(mock_context, mock_agent, mock_tool, "result")
@@ -184,7 +184,7 @@ class TestOnToolEnd:
     ) -> None:
         mock_client.create_reservation.return_value = make_success_response()
         mock_client.commit_reservation.return_value = make_http_error(500)
-        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10})
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
         await h.on_tool_end(mock_context, mock_agent, mock_tool, "result")
@@ -447,7 +447,7 @@ class TestHeartbeat:
     ) -> None:
         mock_client.create_reservation.return_value = make_success_response()
         mock_client.commit_reservation.return_value = make_commit_response()
-        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10})
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
         pending = h._tracker.pop_tool("test-tool")
@@ -472,7 +472,7 @@ class TestHeartbeat:
     ) -> None:
         mock_client.create_reservation.return_value = make_success_response()
         mock_client.commit_reservation.return_value = make_commit_response()
-        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10})
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
         # Verify heartbeat is running
@@ -613,7 +613,7 @@ class TestReleasePending:
     ) -> None:
         mock_client.create_reservation.return_value = make_success_response()
         mock_client.release_reservation.return_value = make_commit_response()
-        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10})
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
         await h.on_llm_start(mock_context, mock_agent, None, [])
@@ -634,7 +634,7 @@ class TestReleasePending:
     ) -> None:
         mock_client.create_reservation.return_value = make_success_response()
         mock_client.release_reservation.return_value = make_http_error(500)
-        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10})
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
         await h.release_pending()  # should not raise
@@ -644,7 +644,7 @@ class TestReleasePending:
     ) -> None:
         mock_client.create_reservation.return_value = make_success_response()
         mock_client.release_reservation.side_effect = ConnectionError("down")
-        h = _hooks(mock_client, tool_risk={"test-tool": 10})
+        h = _hooks(mock_client, tool_estimates={"test-tool": 10})
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
         await h.release_pending()  # should not raise

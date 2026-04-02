@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 DEFAULT_LLM_ESTIMATE: int = 500_000
-"""Default LLM call estimate in budget units (~$0.005 in USD_MICROCENTS)."""
+"""Default LLM call estimate in USD_MICROCENTS (~$0.005)."""
 
-DEFAULT_TOOL_RISK: int = 1
-"""Default risk points for unmapped tools."""
+DEFAULT_TOOL_ESTIMATE: int = 1
+"""Default estimate for unmapped tool reservations."""
 
 DEFAULT_TTL_MS: int = 60_000
 """Default reservation time-to-live in milliseconds."""

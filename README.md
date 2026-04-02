@@ -6,7 +6,7 @@
 
 # Cycles OpenAI Agents SDK Integration
 
-Budget governance for the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python), powered by [Cycles](https://runcycles.io).
+Cycles governance for the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python), powered by [Cycles](https://runcycles.io).
 
 ## Prerequisites
 
@@ -22,12 +22,12 @@ Before you begin, make sure you have:
 
 ## Why
 
-The OpenAI Agents SDK gives you hooks and guardrails for content safety, but **nothing for cost control or action authority**. Without budget governance:
+The OpenAI Agents SDK gives you hooks and guardrails for content safety, but **nothing for governance or action authority**. Without Cycles governance:
 
 - A retry loop burns through $47 of API calls before anyone notices.
 - An agent with a `send_email` tool sends 200 emails in a single run because nothing limits it.
 - You can't give Tenant A a $10/day budget and Tenant B a $100/day budget — every tenant gets unlimited access.
-- There's no audit trail showing which agent called which tool, how many tokens it used, or what it cost.
+- There's no audit trail showing which agent called which tool, how many tokens it used, or what was consumed.
 
 **This plugin fixes all of that with one line:**
 
@@ -41,8 +41,8 @@ Every LLM call and every tool call in the entire agent run — including handoff
 
 | Problem | How This Solves It |
 |---------|-------------------|
-| Runaway LLM costs | Every LLM call reserves budget before running. DENY = agent stops. |
-| Uncontrolled tool actions | Tool risk map assigns point costs (`send_email: 50`, `search: 0`). High-risk tools exhaust budget faster. |
+| Runaway LLM spending | Every LLM call reserves budget before running. DENY = agent stops. |
+| Uncontrolled tool actions | Tool estimate map assigns per-call estimates (`send_email: 50`, `search: 0`). Higher-estimate tools consume budget faster. |
 | No per-tenant limits | Pass `tenant="acme"` — Cycles enforces per-tenant budgets server-side. |
 | No pre-run check | `cycles_budget_guardrail` calls `/v1/decide` before the agent starts. Zero tokens consumed on DENY. |
 | No audit trail | Every reservation, commit, and handoff is recorded in the Cycles ledger. |
@@ -80,10 +80,10 @@ guardrail = cycles_budget_guardrail(tenant="acme-corp", estimate=5_000_000)
 hooks = CyclesRunHooks(
     tenant="acme-corp",
     app="support-platform",
-    tool_risk={
-        "send_email": 50,      # 50 risk points
-        "update_crm": 10,      # 10 risk points
-        "search_knowledge": 0, # free — no reservation
+    tool_estimates={
+        "send_email": 50,      # estimate 50
+        "update_crm": 10,      # estimate 10
+        "search_knowledge": 0, # zero estimate — no reservation
     },
 )
 
@@ -102,9 +102,9 @@ The hooks plug into the SDK's native `RunHooks` interface and govern the **entir
 
 | Hook | Cycles API Call | Blocking | Detail |
 |------|----------------|----------|--------|
-| `on_tool_start` | `create_reservation` (risk points) | Raises on DENY | Budget reserved based on tool risk map |
-| `on_tool_end` | `commit_reservation` | No | Actual risk points committed |
-| `on_llm_start` | `create_reservation` (token/USD budget) | Raises on DENY | Budget reserved before each LLM call |
+| `on_tool_start` | `create_reservation` (tool estimate) | Raises on DENY | Budget reserved based on tool estimate map |
+| `on_tool_end` | `commit_reservation` | No | Actual amount committed |
+| `on_llm_start` | `create_reservation` (LLM estimate) | Raises on DENY | Budget reserved before each LLM call |
 | `on_llm_end` | `commit_reservation` (actual tokens) | No | Real token count from `response.usage` committed |
 | `on_handoff` | `create_event` (audit trail) | No | Handoff recorded in Cycles ledger |
 
@@ -145,7 +145,7 @@ from runcycles_openai_agents import cycles_budget_guardrail
 
 guardrail = cycles_budget_guardrail(
     tenant="acme-corp",
-    estimate=5_000_000,      # expected total run cost
+    estimate=5_000_000,      # expected total run estimate
     unit=Unit.USD_MICROCENTS,
     fail_open=True,          # allow if Cycles server is down
 )
@@ -153,22 +153,22 @@ guardrail = cycles_budget_guardrail(
 agent = Agent(name="bot", input_guardrails=[guardrail])
 ```
 
-## Tool risk mapping
+## Tool estimate mapping
 
-Define a risk policy once. New tools added to the agent get a default risk level automatically:
+Define an estimate policy once. New tools added to the agent get a default estimate automatically:
 
 ```python
-from runcycles_openai_agents import ToolRiskMap, ToolRiskConfig
+from runcycles_openai_agents import ToolEstimateMap, ToolEstimateConfig
 
 hooks = CyclesRunHooks(
     tenant="acme-corp",
-    tool_risk=ToolRiskMap(
+    tool_estimates=ToolEstimateMap(
         mapping={
             "send_email": 50,
-            "update_crm": ToolRiskConfig(risk_points=10, action_kind="tool.crm.update"),
-            "search_knowledge": 0,  # zero-cost — no reservation, no API call
+            "update_crm": ToolEstimateConfig(estimate=10, action_kind="tool.crm.update"),
+            "search_knowledge": 0,  # zero estimate — no reservation, no API call
         },
-        default_risk=1,  # any unmapped tool costs 1 point
+        default_estimate=1,  # any unmapped tool uses estimate 1
     ),
 )
 ```
@@ -189,7 +189,7 @@ hooks = CyclesRunHooks(client=client, tenant="acme-corp")
 
 ### Fail-open / fail-closed
 
-By default, if the Cycles server is unreachable the agent continues (`fail_open=True`). Set `fail_open=False` to enforce strict budget governance:
+By default, if the Cycles server is unreachable the agent continues (`fail_open=True`). Set `fail_open=False` to enforce strict governance:
 
 ```python
 hooks = CyclesRunHooks(tenant="acme", fail_open=False)
@@ -207,8 +207,8 @@ CyclesRunHooks(
     workflow="case-resolution", # Subject.workflow
     agent="case-resolver",      # Subject.agent (overridden by actual agent name)
     toolset=None,               # Subject.toolset (overridden by tool name)
-    tool_risk={"email": 50},    # dict or ToolRiskMap
-    default_tool_risk=1,        # risk points for unmapped tools
+    tool_estimates={"email": 50}, # dict or ToolEstimateMap
+    default_tool_estimate=1,    # estimate for unmapped tools
     llm_estimate=500_000,       # per-LLM-call estimate (default ~$0.005)
     llm_unit=Unit.USD_MICROCENTS,
     fail_open=True,             # allow execution if Cycles is down
@@ -221,7 +221,7 @@ CyclesRunHooks(
 ## Features
 
 - **Framework-native**: Plugs into the SDK's `RunHooks` interface — not function-level decoration
-- **Policy-driven**: Define tool risk once in a map, not per-function
+- **Policy-driven**: Define tool estimates once in a map, not per-function
 - **LLM governance**: Every LLM call reserves and commits with real token metrics
 - **Pre-run guardrail**: `/v1/decide` check before agent starts — zero tokens on DENY
 - **Handoff-aware**: Agent handoffs recorded as audit events in the Cycles ledger
@@ -238,7 +238,7 @@ The [`examples/`](examples/) directory contains runnable integration examples:
 | Example | Description |
 |---------|-------------|
 | [basic_budget.py](examples/basic_budget.py) | LLM token budget enforcement |
-| [tool_governance.py](examples/tool_governance.py) | Tool risk mapping — high-risk tools cost more, read-only tools are free |
+| [tool_governance.py](examples/tool_governance.py) | Tool estimate mapping — higher-estimate tools consume more, read-only tools use zero estimate |
 | [multi_agent.py](examples/multi_agent.py) | Multi-agent handoff with shared budget and pre-run guardrail |
 
 See [examples/README.md](examples/README.md) for setup instructions.

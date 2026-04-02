@@ -8,3 +8,4 @@ build/
 .ruff_cache/
 *.egg
 .coverage
+.claude/settings.local.json

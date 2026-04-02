@@ -1,7 +1,7 @@
 # Cycles OpenAI Agents SDK Integration — Audit
 
-**Date:** 2026-03-27
-**Package:** `runcycles-openai-agents` v0.1.0
+**Date:** 2026-04-02
+**Package:** `runcycles-openai-agents` v0.2.0
 **OpenAI Agents SDK:** v0.13.2
 **Cycles Client:** `runcycles` v0.2.0
 **Protocol Spec:** `cycles-protocol-v0.yaml` (v0.1.24)
@@ -14,14 +14,16 @@
 |----------|------|--------|
 | Hook method signatures vs SDK | 7/7 | 0 |
 | Guardrail integration vs SDK | 3/3 | 0 |
-| Cycles API calls (reserve/commit/release/decide/event) | 5/5 | 0 |
+| Cycles API calls (reserve/commit/release/decide/event) | 6/6 | 0 |
 | Model constructors (field names, required fields) | 7/7 | 0 |
+| Amount constructions (unit, amount fields) | 6/6 | 0 |
 | Error handling (fail-open/fail-closed, DENY, transport) | 6/6 | 0 |
-| Reservation lifecycle (heartbeat, release on failure) | 3/3 | 0 |
-| Test coverage | — | 0 (97.4%, threshold 95%) |
+| Reservation lifecycle (heartbeat, release on failure) | 4/4 | 0 |
+| Protocol terminology alignment | — | 0 |
+| Test coverage | — | 0 (100%, threshold 95%) |
 | Type safety (mypy strict) | — | 0 |
 
-**Overall: Integration is SDK-conformant and protocol-conformant.** All hook signatures match the OpenAI Agents SDK `RunHooksBase` class. All Cycles API calls use correct model constructors with valid field names.
+**Overall: Integration is SDK-conformant, protocol-conformant, and terminology-aligned.** All hook signatures match the OpenAI Agents SDK `RunHooksBase` class. All Cycles API calls use correct model constructors with valid field names. Terminology follows the protocol's unit-agnostic `Amount(unit, amount)` / `estimate` / `actual` model.
 
 ---
 
@@ -31,10 +33,12 @@ Verified the following across OpenAI Agents SDK source, Cycles protocol spec, an
 
 - All 7 hook method signatures against `RunHooksBase` in `agents/lifecycle.py`
 - `InputGuardrail` construction and function signature against `agents/guardrail.py`
-- All 5 Cycles API call patterns (reserve, commit, release, extend, decide, event)
+- All 6 Cycles API call patterns (reserve, commit, release, extend, decide, event)
 - All 7 model constructors (field names, required fields, types)
+- All 6 `Amount()` constructions (correct `unit` and `amount` fields)
 - Error handling paths (transport error, HTTP error, DENY decision)
 - Reservation lifecycle (heartbeat extension, release on failure)
+- Terminology consistency with protocol spec (`estimate`, `actual`, `Amount`)
 
 ---
 
@@ -97,6 +101,21 @@ Verified against `InputGuardrail.run()` in `agents/guardrail.py:120` which calls
 
 ---
 
+## PASS — Amount Construction Verification
+
+All 6 `Amount()` constructions verified against protocol spec:
+
+| Location | Construction | Request Field | Unit Source | Amount Source | Match |
+|----------|-------------|---------------|-------------|---------------|-------|
+| `hooks.py` tool reserve | `Amount(unit=est_cfg.unit, amount=est_cfg.estimate)` | `ReservationCreateRequest.estimate` | `ToolEstimateConfig.unit` | `ToolEstimateConfig.estimate` | PASS |
+| `hooks.py` tool commit | `Amount(unit=pending.unit, amount=pending.estimate)` | `CommitRequest.actual` | `PendingReservation.unit` | `PendingReservation.estimate` | PASS |
+| `hooks.py` LLM reserve | `Amount(unit=self._llm_unit, amount=self._llm_estimate)` | `ReservationCreateRequest.estimate` | `CyclesRunHooks.llm_unit` | `CyclesRunHooks.llm_estimate` | PASS |
+| `hooks.py` LLM commit | `Amount(unit=pending.unit, amount=actual_amount)` | `CommitRequest.actual` | `PendingReservation.unit` | computed or estimate | PASS |
+| `hooks.py` handoff event | `Amount(unit=Unit.RISK_POINTS, amount=0)` | `EventCreateRequest.actual` | literal `RISK_POINTS` | literal `0` | PASS |
+| `guardrail.py` decide | `Amount(unit=unit, amount=estimate)` | `DecisionRequest.estimate` | function param | function param | PASS |
+
+---
+
 ## PASS — Error Handling
 
 | Scenario | Behaviour | Match |
@@ -117,27 +136,42 @@ Verified against `InputGuardrail.run()` in `agents/guardrail.py:120` which calls
 | Heartbeat (TTL extension) | `asyncio.Task` at `max(ttl_ms/2, 1000)ms` intervals using `extend_reservation` | PASS |
 | Heartbeat cancellation | `cancel_heartbeat()` on `on_tool_end` / `on_llm_end` | PASS |
 | Release on failure | `release_pending()` releases all pending reservations and cancels heartbeats | PASS |
-| Zero-cost tool skip | Tools with `risk_points=0` bypass reservation entirely | PASS |
+| Zero-estimate tool skip | Tools with `estimate=0` bypass reservation entirely | PASS |
+
+---
+
+## PASS — Protocol Terminology Alignment
+
+All naming follows the protocol's unit-agnostic model:
+
+| Concept | Protocol Term | Integration Term | Match |
+|---------|--------------|-----------------|-------|
+| Pre-execution amount | `ReservationCreateRequest.estimate: Amount` | `ToolEstimateConfig.estimate: int` + `unit: Unit` | PASS |
+| Post-execution amount | `CommitRequest.actual: Amount` | `PendingReservation.estimate` (or computed tokens) | PASS |
+| Amount container | `Amount(unit, amount)` | `Amount(unit=..., amount=...)` at all 6 sites | PASS |
+| Unit types | `Unit` enum (`USD_MICROCENTS`, `TOKENS`, `CREDITS`, `RISK_POINTS`) | Same enum, configurable per operation | PASS |
+| LLM pre-execution amount | `estimate: Amount` | `llm_estimate: int` + `llm_unit: Unit` | PASS |
+| Guardrail pre-run amount | `estimate: Amount` | `estimate: int` + `unit: Unit` | PASS |
+
+No references to deprecated terminology (`risk_points`, `tool_risk`, `is_zero_cost`, `zero-cost`) remain in source, tests, or documentation.
 
 ---
 
 ## Test Coverage
 
 ```
-92 tests, 97.44% coverage (threshold: 95%)
+97 tests, 100% coverage (threshold: 95%)
 
 src/runcycles_openai_agents/__init__.py        100%
 src/runcycles_openai_agents/_defaults.py       100%
 src/runcycles_openai_agents/_state.py          100%
 src/runcycles_openai_agents/guardrail.py       100%
-src/runcycles_openai_agents/hooks.py            95%
-src/runcycles_openai_agents/risk_map.py        100%
+src/runcycles_openai_agents/hooks.py           100%
+src/runcycles_openai_agents/tool_estimate_map.py  100%
 ```
-
-Uncovered lines in hooks.py (139-150): heartbeat async loop body — internal timing-dependent code that requires real async scheduling to exercise.
 
 ---
 
 ## Verdict
 
-The integration is **fully conformant** with both the OpenAI Agents SDK v0.13.2 hook/guardrail API and the Cycles Protocol v0.1.24 reservation lifecycle. All model constructors, field names, and API call patterns match the respective source code. No open issues.
+The integration is **fully conformant** with the OpenAI Agents SDK v0.13.2 hook/guardrail API, the Cycles Protocol v0.1.24 reservation lifecycle, and the protocol's unit-agnostic terminology. All model constructors, field names, Amount constructions, and API call patterns match the respective source code. Terminology is consistent across source, tests, examples, and documentation. No open issues.

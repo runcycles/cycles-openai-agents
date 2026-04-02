@@ -1,12 +1,11 @@
-"""Tool risk mapping with action authority.
+"""Tool estimate mapping with action authority.
 
-This example shows how to define a risk policy for tools.  High-risk
-tools like ``send_email`` consume more budget, while read-only tools
-like ``search_knowledge`` are free (zero risk points, no reservation).
+This example shows how to define an estimate policy for tools.  Higher-estimate
+tools like ``send_email`` consume more of the budget, while read-only tools
+like ``search_knowledge`` have a zero estimate (no reservation needed).
 
-If a tool call would exceed the budget, ``context.reject_tool()`` is
-called and the agent receives an error message instead of executing
-the tool.
+If a tool call would exceed the budget, ``BudgetExceededError`` is raised
+and the agent receives an error message instead of executing the tool.
 
 Prerequisites:
     pip install runcycles-openai-agents
@@ -19,7 +18,7 @@ import asyncio
 
 from agents import Agent, Runner, function_tool
 
-from runcycles_openai_agents import CyclesRunHooks, ToolRiskConfig
+from runcycles_openai_agents import CyclesRunHooks, ToolEstimateConfig
 
 
 @function_tool
@@ -44,12 +43,12 @@ async def main() -> None:
     hooks = CyclesRunHooks(
         tenant="acme-corp",
         app="support-platform",
-        tool_risk={
-            "send_email": 50,  # high risk — 50 points
-            "update_crm": ToolRiskConfig(risk_points=10, action_kind="tool.crm.update"),
-            "search_knowledge": 0,  # free — no reservation needed
+        tool_estimates={
+            "send_email": 50,  # estimate 50 — high impact
+            "update_crm": ToolEstimateConfig(estimate=10, action_kind="tool.crm.update"),
+            "search_knowledge": 0,  # zero estimate — no reservation needed
         },
-        default_tool_risk=5,  # any new tool defaults to 5 points
+        default_tool_estimate=5,  # any new tool defaults to estimate 5
     )
 
     agent = Agent(

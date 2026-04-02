@@ -44,11 +44,11 @@ async def main() -> None:
         tenant="acme-corp",
         app="support-platform",
         tool_estimates={
-            "send_email": 50,  # estimate 50 — high impact
+            "send_email": 50,  # 50 RISK_POINTS per call (default unit)
             "update_crm": ToolEstimateConfig(estimate=10, action_kind="tool.crm.update"),
             "search_knowledge": 0,  # zero estimate — no reservation needed
         },
-        default_tool_estimate=5,  # any new tool defaults to estimate 5
+        default_tool_estimate=5,  # unmapped tools: 5 RISK_POINTS
     )
 
     agent = Agent(

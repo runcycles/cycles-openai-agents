@@ -81,8 +81,8 @@ hooks = CyclesRunHooks(
     tenant="acme-corp",
     app="support-platform",
     tool_estimates={
-        "send_email": 50,      # estimate 50
-        "update_crm": 10,      # estimate 10
+        "send_email": 50,      # 50 RISK_POINTS per call
+        "update_crm": 10,      # 10 RISK_POINTS per call
         "search_knowledge": 0, # zero estimate — no reservation
     },
 )
@@ -164,11 +164,16 @@ hooks = CyclesRunHooks(
     tenant="acme-corp",
     tool_estimates=ToolEstimateMap(
         mapping={
-            "send_email": 50,
-            "update_crm": ToolEstimateConfig(estimate=10, action_kind="tool.crm.update"),
-            "search_knowledge": 0,  # zero estimate — no reservation, no API call
+            "send_email": 50,                       # 50 RISK_POINTS (default unit)
+            "update_crm": ToolEstimateConfig(
+                estimate=10,
+                action_kind="tool.crm.update",
+                unit=Unit.RISK_POINTS,              # explicit unit
+            ),
+            "search_knowledge": 0,                  # zero estimate — no reservation
         },
-        default_estimate=1,  # any unmapped tool uses estimate 1
+        default_estimate=1,                         # unmapped tools: 1 RISK_POINT
+        default_unit=Unit.RISK_POINTS,              # unit for int shorthand values
     ),
 )
 ```
@@ -207,9 +212,9 @@ CyclesRunHooks(
     workflow="case-resolution", # Subject.workflow
     agent="case-resolver",      # Subject.agent (overridden by actual agent name)
     toolset=None,               # Subject.toolset (overridden by tool name)
-    tool_estimates={"email": 50}, # dict or ToolEstimateMap
-    default_tool_estimate=1,    # estimate for unmapped tools
-    llm_estimate=500_000,       # per-LLM-call estimate (default ~$0.005)
+    tool_estimates={"email": 50}, # dict or ToolEstimateMap (default unit: RISK_POINTS)
+    default_tool_estimate=1,    # estimate for unmapped tools (in default unit)
+    llm_estimate=500_000,       # per-LLM-call estimate (~$0.005 in USD_MICROCENTS)
     llm_unit=Unit.USD_MICROCENTS,
     fail_open=True,             # allow execution if Cycles is down
     ttl_ms=60_000,              # reservation TTL (heartbeat extends at half-interval)

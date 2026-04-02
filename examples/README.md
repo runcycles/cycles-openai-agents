@@ -1,6 +1,6 @@
 # Examples
 
-Runnable examples demonstrating Cycles budget governance with the OpenAI Agents SDK.
+Runnable examples demonstrating Cycles governance with the OpenAI Agents SDK.
 
 ## Prerequisites
 
@@ -16,5 +16,5 @@ export OPENAI_API_KEY=sk-...
 | Example | Description |
 |---------|-------------|
 | [basic_budget.py](basic_budget.py) | LLM token budget enforcement — every LLM call is reserved and committed |
-| [tool_governance.py](tool_governance.py) | Tool risk mapping — high-risk tools cost more budget, read-only tools are free |
+| [tool_governance.py](tool_governance.py) | Tool estimate mapping — higher-estimate tools consume more budget, read-only tools use zero estimate |
 | [multi_agent.py](multi_agent.py) | Multi-agent handoff with shared budget and pre-run guardrail |

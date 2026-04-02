@@ -1,4 +1,4 @@
-"""CyclesRunHooks — Cycles budget governance for OpenAI Agents SDK runs."""
+"""CyclesRunHooks — Cycles governance for OpenAI Agents SDK runs."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ from runcycles_openai_agents._defaults import (
     DEFAULT_TTL_MS,
 )
 from runcycles_openai_agents._state import PendingReservation, ReservationTracker
-from runcycles_openai_agents.risk_map import ToolRiskConfig, ToolRiskMap
+from runcycles_openai_agents.tool_estimate_map import ToolEstimateConfig, ToolEstimateMap
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ TContext = TypeVar("TContext")
 
 
 class CyclesRunHooks(RunHooks[TContext]):
-    """Plugs Cycles budget governance into every tool call, LLM call, and
+    """Plugs Cycles governance into every tool call, LLM call, and
     handoff in an OpenAI Agents SDK run.
 
     Usage::
@@ -49,7 +49,7 @@ class CyclesRunHooks(RunHooks[TContext]):
         hooks = CyclesRunHooks(
             tenant="acme-corp",
             app="support-platform",
-            tool_risk={"send_email": 50, "search": 0},
+            tool_estimates={"send_email": 50, "search": 0},
         )
         result = await Runner.run(agent, input="...", hooks=hooks)
     """
@@ -66,8 +66,8 @@ class CyclesRunHooks(RunHooks[TContext]):
         agent: str | None = None,
         toolset: str | None = None,
         # Tool governance
-        tool_risk: dict[str, int | ToolRiskConfig] | ToolRiskMap | None = None,
-        default_tool_risk: int = 1,
+        tool_estimates: dict[str, int | ToolEstimateConfig] | ToolEstimateMap | None = None,
+        default_tool_estimate: int = 1,
         # LLM governance
         llm_estimate: int = DEFAULT_LLM_ESTIMATE,
         llm_unit: Unit = Unit.USD_MICROCENTS,
@@ -91,10 +91,10 @@ class CyclesRunHooks(RunHooks[TContext]):
         self._agent = agent
         self._toolset = toolset
 
-        if isinstance(tool_risk, ToolRiskMap):
-            self._risk_map = tool_risk
+        if isinstance(tool_estimates, ToolEstimateMap):
+            self._tool_estimate_map = tool_estimates
         else:
-            self._risk_map = ToolRiskMap(mapping=tool_risk, default_risk=default_tool_risk)
+            self._tool_estimate_map = ToolEstimateMap(mapping=tool_estimates, default_estimate=default_tool_estimate)
 
         self._llm_estimate = llm_estimate
         self._llm_unit = llm_unit
@@ -194,16 +194,16 @@ class CyclesRunHooks(RunHooks[TContext]):
         agent: Agent[TContext],
         tool: Tool,
     ) -> None:
-        if self._risk_map.is_zero_cost(tool.name):
-            logger.debug("cycles: tool_start skip zero-cost tool=%s", tool.name)
+        if self._tool_estimate_map.is_zero_estimate(tool.name):
+            logger.debug("cycles: tool_start skip zero-estimate tool=%s", tool.name)
             return
 
-        risk_cfg = self._risk_map.get(tool.name)
+        est_cfg = self._tool_estimate_map.get(tool.name)
         request = ReservationCreateRequest(
             idempotency_key=self._idem(),
             subject=self._subject(agent_name=agent.name, toolset_name=tool.name),
-            action=Action(kind=risk_cfg.action_kind, name=tool.name),
-            estimate=Amount(unit=risk_cfg.unit, amount=risk_cfg.risk_points),
+            action=Action(kind=est_cfg.action_kind, name=tool.name),
+            estimate=Amount(unit=est_cfg.unit, amount=est_cfg.estimate),
             ttl_ms=self._ttl_ms,
             overage_policy=self._overage_policy,
             dry_run=self._dry_run or None,
@@ -216,7 +216,7 @@ class CyclesRunHooks(RunHooks[TContext]):
                 logger.warning("cycles: transport error on tool reserve, fail-open tool=%s", tool.name)
                 return
             raise BudgetExceededError(
-                f"Cycles budget service unavailable for tool={tool.name}",
+                f"Cycles service unavailable for tool={tool.name}",
                 status=-1,
                 error_code="TRANSPORT_ERROR",
             )
@@ -239,7 +239,7 @@ class CyclesRunHooks(RunHooks[TContext]):
         if decision == "DENY":
             reason = response.get_body_attribute("reason_code") or "budget_exceeded"
             raise BudgetExceededError(
-                f"Tool budget denied for {tool.name}: {reason}",
+                f"Tool reservation denied for {tool.name}: {reason}",
                 status=response.status,
                 error_code="BUDGET_EXCEEDED",
             )
@@ -253,8 +253,8 @@ class CyclesRunHooks(RunHooks[TContext]):
             reservation_id=reservation_id,
             tool_name=tool.name,
             agent_name=agent.name,
-            estimate=risk_cfg.risk_points,
-            unit=risk_cfg.unit,
+            estimate=est_cfg.estimate,
+            unit=est_cfg.unit,
             heartbeat_task=self._start_heartbeat(reservation_id),
         )
         self._tracker.register_tool(tool.name, pending)
@@ -309,7 +309,7 @@ class CyclesRunHooks(RunHooks[TContext]):
                 logger.warning("cycles: transport error on LLM reserve, fail-open agent=%s", agent.name)
                 return
             raise BudgetExceededError(
-                "Cycles budget service unavailable",
+                "Cycles service unavailable",
                 status=-1,
                 error_code="TRANSPORT_ERROR",
             )
@@ -328,7 +328,7 @@ class CyclesRunHooks(RunHooks[TContext]):
         if decision == "DENY":
             reason = response.get_body_attribute("reason_code") or "budget_exceeded"
             raise BudgetExceededError(
-                f"LLM budget denied: {reason}",
+                f"LLM reservation denied: {reason}",
                 status=response.status,
                 error_code="BUDGET_EXCEEDED",
             )

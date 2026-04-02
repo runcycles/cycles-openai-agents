@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "runcycles-openai-agents"
 version = "0.2.0"
-description = "Cycles budget and tool governance for OpenAI Agents SDK — per-tenant budgets, tool risk estimates, and audit trails"
+description = "Cycles budget and tool governance for OpenAI Agents SDK — per-tenant budgets, tool estimates, and audit trails"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"

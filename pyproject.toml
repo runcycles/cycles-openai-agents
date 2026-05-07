@@ -4,15 +4,46 @@ build-backend = "hatchling.build"
 
 [project]
 name = "runcycles-openai-agents"
-version = "0.2.0"
-description = "Cycles budget and tool governance for OpenAI Agents SDK — per-tenant budgets, tool estimates, and audit trails"
+version = "0.2.1"
+description = "Runtime budget, action, and audit authority for the OpenAI Agents SDK — enforce LLM cost limits, tool call caps, and audit trails before execution."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
     { name = "Cycles", email = "support@runcycles.io" },
 ]
-keywords = ["cycles", "budget", "governance", "openai", "agents", "llm", "cost-control", "tool-risk", "audit", "rate-limit", "multi-tenant", "reservation"]
+keywords = [
+    # Cost pillar
+    "ai-agent",
+    "agent-budget",
+    "agent-governance",
+    "budget-control",
+    "cost-control",
+    "cost-enforcement",
+    "spending-limit",
+    "llm-cost",
+    # Action / risk pillar
+    "runtime-authority",
+    "action-control",
+    "action-authority",
+    "tool-risk",
+    # Audit pillar
+    "audit-trail",
+    "audit",
+    "compliance",
+    # Multi-tenancy
+    "multi-tenant",
+    # Framework targeting
+    "openai-agents",
+    "openai-agents-sdk",
+    "openai",
+    "anthropic",
+    "mcp",
+    "langchain",
+    # Brand
+    "cycles",
+    "runcycles",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -24,6 +55,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Typing :: Typed",
 ]
 dependencies = [

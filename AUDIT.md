@@ -175,3 +175,15 @@ src/runcycles_openai_agents/tool_estimate_map.py  100%
 ## Verdict
 
 The integration is **fully conformant** with the OpenAI Agents SDK v0.13.2 hook/guardrail API, the Cycles Protocol v0.1.24 reservation lifecycle, and the protocol's unit-agnostic terminology. All model constructors, field names, Amount constructions, and API call patterns match the respective source code. Terminology is consistent across source, tests, examples, and documentation. No open issues.
+
+---
+
+## 0.2.1 — PyPI Metadata Refresh (2026-05-07)
+
+**Files:** `pyproject.toml`. **No code changes.** Wire format, public API, hook/guardrail conformance, and protocol conformance are identical to 0.2.0.
+
+- **Description rewritten** to lead with the cost / action / audit pillars: *"Runtime budget, action, and audit authority for the OpenAI Agents SDK — enforce LLM cost limits, tool call caps, and audit trails before execution."*
+- **Keywords expanded** 12 → 25, organized into category-search terms (`ai-agent`, `agent-budget`, `budget-control`, `cost-enforcement`, `spending-limit`, `llm-cost`, `runtime-authority`, `action-control`, `action-authority`, `audit-trail`, `compliance`, `multi-tenant`), framework targeting (`openai-agents`, `openai-agents-sdk`, `mcp`, `langchain`), and brand.
+- **Classifier added:** `Topic :: Scientific/Engineering :: Artificial Intelligence` — standard PyPI classifier for AI/ML packages.
+
+Driven by package-portfolio SEO diagnostic. The cost / action / audit triad now leads the description, matching the three pillars of Cycles' value proposition.

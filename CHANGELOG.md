@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repository `CODEOWNERS` for required-review routing.
 - Least-privilege `permissions:` blocks on CI workflows.
 
+## [0.2.1] — 2026-05-07
+
+PyPI metadata refresh for category-search discovery. **No code changes** — wire format and public API are identical to 0.2.0.
+
+### Changed
+
+- `pyproject.toml`: rewrote `description` to lead with the cost / action / audit pillars (*"Runtime budget, action, and audit authority for the OpenAI Agents SDK — enforce LLM cost limits, tool call caps, and audit trails before execution."*) and expanded `keywords` from 12 to 25. Added `Topic :: Scientific/Engineering :: Artificial Intelligence` classifier for PyPI browse-by-category surfacing. New keyword groups: cost pillar (`ai-agent`, `agent-budget`, `budget-control`, `cost-enforcement`, `spending-limit`, `llm-cost`), action/risk pillar (`runtime-authority`, `action-control`, `action-authority` — kept existing `tool-risk`), audit pillar (`audit-trail`, `compliance` — kept existing `audit`), and framework targeting (`openai-agents-sdk`, `mcp`, `langchain`).
+
 ## [0.2.0] — 2026-04-02
 
 Align API terminology with Cycles protocol spec v0.1.24 and clarify unit handling in examples.

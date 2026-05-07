@@ -4,9 +4,9 @@
 [![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](https://github.com/runcycles/cycles-openai-agents)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
-# Cycles OpenAI Agents SDK Integration
+# OpenAI Agents SDK Budget Control — Cycles integration for Python
 
-Cycles governance for the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python), powered by [Cycles](https://runcycles.io).
+**Runtime budget, action, and audit authority for the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) — enforce LLM cost limits, tool call caps, action permissions, and audit trails on Python AI agents before execution.** Wraps OpenAI Agents SDK hooks and guardrails with the [Cycles Protocol](https://github.com/runcycles/cycles-protocol) reservation lifecycle: per-tenant budgets, tool risk scoring, pre-run checks, and structured audit trails. Install via `pip install runcycles-openai-agents`.
 
 ## Prerequisites
 

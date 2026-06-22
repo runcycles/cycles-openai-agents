@@ -265,8 +265,12 @@ class CyclesRunHooks(RunHooks[TContext]):
         context: RunContextWrapper[TContext],
         agent: Agent[TContext],
         tool: Tool,
-        result: str,
+        result: object,
     ) -> None:
+        # `result` is typed `object` to match RunHooksBase.on_tool_end (the
+        # openai-agents base widened it from `str`); narrowing it here violates
+        # the Liskov override rule (mypy >=2.1). We don't read `result` — the
+        # commit amount comes from the tracked reservation estimate.
         pending = self._tracker.pop_tool(tool.name)
         if pending is None:
             return

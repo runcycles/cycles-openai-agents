@@ -71,6 +71,10 @@ def make_transport_error() -> CyclesResponse:
     return CyclesResponse.transport_error(ConnectionError("connection refused"))
 
 
-def make_http_error(status: int = 500, message: str = "internal error") -> CyclesResponse:
+def make_http_error(
+    status: int = 500,
+    message: str = "internal error",
+    body: dict[str, Any] | None = None,
+) -> CyclesResponse:
     """Build an HTTP-error :class:`CyclesResponse`."""
-    return CyclesResponse.http_error(status, message)
+    return CyclesResponse.http_error(status, message, body=body)

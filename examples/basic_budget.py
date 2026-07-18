@@ -13,7 +13,7 @@ Prerequisites:
 
 import asyncio
 
-from agents import Agent, Runner
+from agents import Agent
 
 from runcycles_openai_agents import CyclesRunHooks
 
@@ -31,7 +31,7 @@ async def main() -> None:
         instructions="You are a helpful assistant.",
     )
 
-    result = await Runner.run(agent, input="What is the capital of France?", hooks=hooks)
+    result = await hooks.run(agent, input="What is the capital of France?")
     print(result.final_output)
 
 

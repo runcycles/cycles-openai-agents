@@ -1,7 +1,7 @@
 [![PyPI](https://img.shields.io/pypi/v/runcycles-openai-agents?v=1)](https://pypi.org/project/runcycles-openai-agents/)
 [![PyPI Downloads](https://img.shields.io/pypi/dm/runcycles-openai-agents)](https://pypi.org/project/runcycles-openai-agents/)
 [![CI](https://github.com/runcycles/cycles-openai-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/runcycles/cycles-openai-agents/actions)
-[![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](https://github.com/runcycles/cycles-openai-agents)
+[![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](https://github.com/runcycles/cycles-openai-agents)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
 # OpenAI Agents SDK Budget Control — Cycles integration for Python
@@ -32,7 +32,7 @@ The OpenAI Agents SDK gives you hooks and guardrails for content safety, but **n
 **This plugin fixes all of that with one line:**
 
 ```python
-result = await Runner.run(agent, input="...", hooks=CyclesRunHooks(tenant="acme"))
+result = await CyclesRunHooks(tenant="acme").run(agent, input="...")
 ```
 
 Every LLM call and every tool call in the entire agent run — including handoffs to sub-agents — automatically reserves budget before execution and commits actual usage after. If the budget is exhausted, the agent stops. No per-function decoration. No code changes to your tools.
@@ -46,7 +46,7 @@ Every LLM call and every tool call in the entire agent run — including handoff
 | No per-tenant limits | Pass `tenant="acme"` — Cycles enforces per-tenant budgets server-side. |
 | No pre-run check | `cycles_budget_guardrail` calls `/v1/decide` before the agent starts. Zero tokens consumed on DENY. |
 | No audit trail | Every reservation, commit, and handoff is recorded in the Cycles ledger. |
-| Agent runs forever | TTL heartbeat auto-extends reservations. If the agent dies, reservations expire and budget is released. |
+| Long-running or abandoned calls | TTL heartbeats extend active reservations for at most 10 minutes by default. Cleanup releases known reservations; a missed cleanup path still degrades to TTL expiry. |
 
 ## Installation
 
@@ -70,7 +70,7 @@ export CYCLES_API_KEY=cyc_live_...
 ## Quick Start
 
 ```python
-from agents import Agent, Runner
+from agents import Agent
 from runcycles_openai_agents import CyclesRunHooks, cycles_budget_guardrail
 
 # Pre-run budget check — agent never starts if budget exhausted
@@ -93,12 +93,12 @@ agent = Agent(
     input_guardrails=[guardrail],
 )
 
-result = await Runner.run(agent, input="...", hooks=hooks)
+result = await hooks.run(agent, input="...")
 ```
 
 ### Hook lifecycle
 
-The hooks plug into the SDK's native `RunHooks` interface and govern the **entire agent run** automatically:
+The hooks plug into the SDK's native `RunHooks` interface and govern the **entire agent run**. Use `hooks.run(...)` for non-streaming runs or `hooks.run_streamed(...)` for streaming runs so cleanup is attached at the SDK run-finalization boundary:
 
 | Hook | Cycles API Call | Blocking | Detail |
 |------|----------------|----------|--------|
@@ -112,17 +112,25 @@ All raised exceptions from budget denial trigger `BudgetExceededError`. See [Err
 
 ## Error handling
 
-If `Runner.run()` raises, pending reservations stay locked until TTL expires. Call `release_pending()` to free them immediately:
+`CyclesRunHooks.run()` releases reservations scoped to that run before re-raising an exception or `asyncio.CancelledError`:
 
 ```python
 hooks = CyclesRunHooks(tenant="acme-corp", app="support-platform")
 
-try:
-    result = await Runner.run(agent, input="...", hooks=hooks)
-except Exception:
-    await hooks.release_pending("agent_run_failed")
-    raise
+result = await hooks.run(agent, input="...")
 ```
+
+Streaming runs receive the same protection. Consume the returned proxy's events, or call its synchronous `cancel()` method; either path waits for or schedules run-scoped cleanup:
+
+```python
+result = hooks.run_streamed(agent, input="...")
+async for event in result.stream_events():
+    handle(event)
+```
+
+The OpenAI Agents SDK does not expose a general `RunHooks.on_error` callback. If you call bare `Runner.run(..., hooks=hooks)` or `Runner.run_streamed(..., hooks=hooks)`, automatic exception/cancellation cleanup cannot run. In a single-run error path, call `release_pending()`; when multiple runs are pending it raises instead of guessing and releasing another run. Prefer the wrappers for concurrent runs because they carry a stable run ID into scoped cleanup. `release_all_pending()` is the explicit application-shutdown escape hatch. Heartbeats are capped at 10 minutes by default, so even a missed cleanup path eventually falls back to reservation TTL expiry instead of extending forever.
+
+Commit failures are isolated from later operations. A reservation leaves active start/end correlation before its commit is attempted: ordinary client rejections are released immediately, already-finalized and idempotency-mismatch responses are retired without an unsafe release, and exhausted ambiguous failures remain available only for run cleanup. A later LLM or tool completion therefore cannot accidentally reuse the failed reservation or attach new usage metrics to it.
 
 When budget is denied, the hooks raise `BudgetExceededError`:
 
@@ -130,7 +138,7 @@ When budget is denied, the hooks raise `BudgetExceededError`:
 from runcycles import BudgetExceededError
 
 try:
-    result = await Runner.run(agent, input="...", hooks=hooks)
+    result = await hooks.run(agent, input="...")
 except BudgetExceededError as e:
     print(f"Budget denied: {e}")
     # Agent stopped — no further tokens consumed
@@ -194,10 +202,10 @@ hooks = CyclesRunHooks(client=client, tenant="acme-corp")
 
 ### Fail-open / fail-closed
 
-By default, if the Cycles server is unreachable the agent continues (`fail_open=True`). Set `fail_open=False` to enforce strict governance:
+Hooks are fail-closed by default (`fail_open=False`): if the Cycles server is unreachable, the governed operation is blocked. Availability-first behavior remains an explicit opt-in:
 
 ```python
-hooks = CyclesRunHooks(tenant="acme", fail_open=False)
+hooks = CyclesRunHooks(tenant="acme", fail_open=True)
 ```
 
 ### All options
@@ -216,8 +224,11 @@ CyclesRunHooks(
     default_tool_estimate=1,    # estimate for unmapped tools (in default unit)
     llm_estimate=500_000,       # per-LLM-call estimate (~$0.005 in USD_MICROCENTS)
     llm_unit=Unit.USD_MICROCENTS,
-    fail_open=True,             # allow execution if Cycles is down
+    fail_open=False,            # block execution if Cycles is down (default)
     ttl_ms=60_000,              # reservation TTL (heartbeat extends at half-interval)
+    heartbeat_max_age_ms=600_000, # stop extending after 10 minutes
+    heartbeat_max_extensions=None, # optional additional extension-count cap
+    commit_max_attempts=2,      # retry transport, 429, and 5xx commit failures
     overage_policy=CommitOveragePolicy.ALLOW_IF_AVAILABLE,
     dry_run=False,              # shadow mode — no budget consumed
 )
@@ -230,9 +241,10 @@ CyclesRunHooks(
 - **LLM governance**: Every LLM call reserves and commits with real token metrics
 - **Pre-run guardrail**: `/v1/decide` check before agent starts — zero tokens on DENY
 - **Handoff-aware**: Agent handoffs recorded as audit events in the Cycles ledger
-- **Automatic heartbeat**: TTL extension keeps reservations alive during long operations
-- **Fail-safe cleanup**: `release_pending()` frees locked budget when agent runs fail
-- **Fail-open by default**: Agent continues if Cycles server is unreachable
+- **Bounded heartbeat**: TTL extension keeps active reservations alive but stops after a configurable maximum age
+- **Run-finalization cleanup**: `hooks.run()` and `hooks.run_streamed()` release run-scoped reservations on exceptions and cancellation; TTL expiry is the fallback
+- **Replay-safe, isolated commits**: Retries reuse one deterministic request, and failed settlements cannot poison later operation correlation
+- **Fail-closed by default**: Cycles transport and HTTP errors block governed operations; `fail_open=True` is explicit opt-in
 - **Environment config**: `CYCLES_BASE_URL` + `CYCLES_API_KEY` for zero-config setup
 - **Typed exceptions**: `BudgetExceededError` for precise error handling
 

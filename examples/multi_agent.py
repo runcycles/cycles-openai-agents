@@ -2,7 +2,7 @@
 
 This example shows two agents with a handoff.  Cycles governs the
 entire run — including the handoff event — through a single
-``CyclesRunHooks`` instance passed to ``Runner.run()``.
+``CyclesRunHooks.run()`` call.
 
 The guardrail performs a pre-run ``/v1/decide`` check.  If the tenant's
 budget is exhausted the agent never starts (zero tokens consumed).
@@ -16,7 +16,7 @@ Prerequisites:
 
 import asyncio
 
-from agents import Agent, Runner
+from agents import Agent
 
 from runcycles_openai_agents import CyclesRunHooks, cycles_budget_guardrail
 
@@ -43,17 +43,15 @@ async def main() -> None:
     triage_agent = Agent(
         name="triage",
         instructions=(
-            "You triage incoming support requests. "
-            "If the issue is complex, hand off to the escalation specialist."
+            "You triage incoming support requests. If the issue is complex, hand off to the escalation specialist."
         ),
         handoffs=[escalation_agent],
         input_guardrails=[guardrail],
     )
 
-    result = await Runner.run(
+    result = await hooks.run(
         triage_agent,
         input="My account was charged twice and I want a refund immediately!",
-        hooks=hooks,
     )
     print(result.final_output)
 

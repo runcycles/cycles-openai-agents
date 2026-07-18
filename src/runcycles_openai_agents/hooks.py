@@ -7,10 +7,12 @@ import contextvars
 import hashlib
 import logging
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import suppress
 from time import monotonic
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
-from agents import Agent, AgentHookContext, ModelResponse, RunContextWrapper, RunHooks, Runner, Tool
+from agents import Agent, AgentHookContext, ModelResponse, RunContextWrapper, RunHooks, Runner, RunResultStreaming, Tool
 from agents.items import TResponseInputItem
 from agents.tracing import get_current_span, get_current_trace
 from runcycles import (
@@ -22,6 +24,7 @@ from runcycles import (
     CommitRequest,
     CyclesConfig,
     CyclesMetrics,
+    CyclesResponse,
     EventCreateRequest,
     ReleaseRequest,
     ReservationCreateRequest,
@@ -33,6 +36,7 @@ from runcycles import (
 from runcycles_openai_agents._defaults import (
     DEFAULT_ACTION_KIND_HANDOFF,
     DEFAULT_ACTION_KIND_LLM,
+    DEFAULT_COMMIT_MAX_ATTEMPTS,
     DEFAULT_HEARTBEAT_MAX_AGE_MS,
     DEFAULT_LLM_ESTIMATE,
     DEFAULT_TTL_MS,
@@ -48,6 +52,71 @@ _active_run_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "cycles_openai_agents_run_id",
     default=None,
 )
+
+
+class CyclesRunResultStreaming:
+    """Lifecycle-safe proxy for the SDK's streaming run result."""
+
+    def __init__(self, result: RunResultStreaming, hooks: CyclesRunHooks[Any], run_id: str) -> None:
+        self._result = result
+        self._hooks = hooks
+        self._run_id = run_id
+        self._cancel_requested = False
+        self._cleanup_task: asyncio.Task[None] | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._result, name)
+
+    async def _cleanup(self, reason: str) -> None:
+        run_loop_task = self._result.run_loop_task
+        if run_loop_task is not None and not run_loop_task.done():
+            with suppress(asyncio.CancelledError, Exception):
+                await run_loop_task
+        try:
+            await self._hooks.release_pending(reason, run_id=self._run_id)
+        finally:
+            self._hooks._tracker.forget_run(self._run_id)
+
+    def _ensure_cleanup(self, reason: str) -> asyncio.Task[None]:
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._cleanup(reason))
+        return self._cleanup_task
+
+    def cancel(self, mode: Literal["immediate", "after_turn"] = "immediate") -> None:
+        """Cancel the SDK stream and schedule run-scoped reservation cleanup."""
+        self._cancel_requested = True
+        self._result.cancel(mode=mode)
+        self._ensure_cleanup("agent_run_cancelled")
+
+    async def stream_events(self) -> AsyncIterator[Any]:
+        """Proxy SDK events and await cleanup before propagating termination."""
+        reason: str | None = None
+        try:
+            async for event in self._result.stream_events():
+                yield event
+        except asyncio.CancelledError:
+            self._cancel_requested = True
+            self._result.cancel()
+            reason = "agent_run_cancelled"
+            raise
+        except GeneratorExit:
+            self._cancel_requested = True
+            self._result.cancel()
+            reason = "agent_run_cancelled:stream_closed"
+            raise
+        except BaseException as exc:
+            reason = f"agent_run_failed:{type(exc).__name__}"
+            raise
+        else:
+            reason = (
+                "agent_run_cancelled" if self._cancel_requested else "agent_run_completed_with_pending_reservations"
+            )
+        finally:
+            if reason is None:
+                self._cancel_requested = True
+                self._result.cancel()
+                reason = "agent_run_cancelled:stream_closed"
+            await asyncio.shield(self._ensure_cleanup(reason))
 
 
 class CyclesRunHooks(RunHooks[TContext]):
@@ -86,6 +155,7 @@ class CyclesRunHooks(RunHooks[TContext]):
         ttl_ms: int = DEFAULT_TTL_MS,
         heartbeat_max_age_ms: int = DEFAULT_HEARTBEAT_MAX_AGE_MS,
         heartbeat_max_extensions: int | None = None,
+        commit_max_attempts: int = DEFAULT_COMMIT_MAX_ATTEMPTS,
         overage_policy: CommitOveragePolicy | str = CommitOveragePolicy.ALLOW_IF_AVAILABLE,
         dry_run: bool = False,
     ) -> None:
@@ -116,8 +186,11 @@ class CyclesRunHooks(RunHooks[TContext]):
             raise ValueError("heartbeat_max_age_ms must be greater than zero")
         if heartbeat_max_extensions is not None and heartbeat_max_extensions <= 0:
             raise ValueError("heartbeat_max_extensions must be greater than zero when set")
+        if commit_max_attempts <= 0:
+            raise ValueError("commit_max_attempts must be greater than zero")
         self._heartbeat_max_age_ms = heartbeat_max_age_ms
         self._heartbeat_max_extensions = heartbeat_max_extensions
+        self._commit_max_attempts = commit_max_attempts
         self._overage_policy = (
             overage_policy if isinstance(overage_policy, CommitOveragePolicy) else CommitOveragePolicy(overage_policy)
         )
@@ -192,6 +265,72 @@ class CyclesRunHooks(RunHooks[TContext]):
         finally:
             self._tracker.forget_run(effective_run_id)
             _active_run_id.reset(token)
+
+    def run_streamed(
+        self,
+        starting_agent: Agent[TContext],
+        input: Any,
+        *,
+        run_id: str | None = None,
+        **runner_kwargs: Any,
+    ) -> CyclesRunResultStreaming:
+        """Start a streaming run whose event iterator finalizes reservations."""
+        if "hooks" in runner_kwargs:
+            raise ValueError("CyclesRunHooks.run_streamed() manages the hooks argument")
+
+        effective_run_id = run_id or uuid.uuid4().hex
+        token = _active_run_id.set(effective_run_id)
+        try:
+            result = Runner.run_streamed(starting_agent, input, hooks=self, **runner_kwargs)
+        finally:
+            _active_run_id.reset(token)
+        return CyclesRunResultStreaming(result, self, effective_run_id)
+
+    @staticmethod
+    def _commit_response_is_retryable(response: CyclesResponse) -> bool:
+        if response.is_transport_error:
+            return True
+        status = int(response.status)
+        return status == 429 or status >= 500
+
+    async def _commit_reservation(
+        self,
+        pending: PendingReservation,
+        actual: Amount,
+        metrics: CyclesMetrics | None = None,
+    ) -> CyclesResponse:
+        """Commit with one stable request and idempotency key across retries."""
+        request = CommitRequest(
+            idempotency_key=pending.commit_idempotency_key,
+            actual=actual,
+            metrics=metrics,
+        )
+        for attempt in range(1, self._commit_max_attempts + 1):
+            try:
+                response = await self._client.commit_reservation(pending.reservation_id, request)
+            except Exception:
+                if attempt >= self._commit_max_attempts:
+                    raise
+                logger.warning(
+                    "cycles: commit raised; retrying reservation=%s attempt=%s",
+                    pending.reservation_id,
+                    attempt,
+                    exc_info=True,
+                )
+                continue
+            if (
+                response.is_success
+                or attempt >= self._commit_max_attempts
+                or not self._commit_response_is_retryable(response)
+            ):
+                return response
+            logger.warning(
+                "cycles: commit failed; retrying reservation=%s attempt=%s status=%s",
+                pending.reservation_id,
+                attempt,
+                response.status,
+            )
+        raise AssertionError("commit retry loop exhausted unexpectedly")
 
     def _start_heartbeat(
         self,
@@ -402,11 +541,10 @@ class CyclesRunHooks(RunHooks[TContext]):
             return
 
         pending.cancel_heartbeat()
-        commit = CommitRequest(
-            idempotency_key=pending.commit_idempotency_key,
-            actual=Amount(unit=pending.unit, amount=pending.estimate),
+        response = await self._commit_reservation(
+            pending,
+            Amount(unit=pending.unit, amount=pending.estimate),
         )
-        response = await self._client.commit_reservation(pending.reservation_id, commit)
         if response.is_success:
             self._tracker.complete_tool(pending)
         else:
@@ -489,14 +627,14 @@ class CyclesRunHooks(RunHooks[TContext]):
                 operation_id=operation_id,
             ),
         )
-        previous = self._tracker.register_llm(pending)
-        if previous is not None:
+        duplicate = self._tracker.register_llm(pending)
+        if duplicate is not None:
             logger.warning(
                 "cycles: replacing duplicate LLM operation run=%s reservation=%s",
                 run_id,
-                previous.reservation_id,
+                duplicate.reservation_id,
             )
-            await self._release_reservation(previous, "duplicate_llm_operation_replaced")
+            await self._release_reservation(duplicate, "duplicate_llm_operation_replaced")
         logger.debug("cycles: llm_start reserved=%s agent=%s", reservation_id, agent.name)
 
     async def on_llm_end(
@@ -517,12 +655,11 @@ class CyclesRunHooks(RunHooks[TContext]):
         if pending.unit == Unit.TOKENS:
             actual_amount = tokens_in + tokens_out
 
-        commit = CommitRequest(
-            idempotency_key=pending.commit_idempotency_key,
-            actual=Amount(unit=pending.unit, amount=actual_amount),
-            metrics=CyclesMetrics(tokens_input=tokens_in, tokens_output=tokens_out),
+        resp = await self._commit_reservation(
+            pending,
+            Amount(unit=pending.unit, amount=actual_amount),
+            CyclesMetrics(tokens_input=tokens_in, tokens_output=tokens_out),
         )
-        resp = await self._client.commit_reservation(pending.reservation_id, commit)
         if resp.is_success:
             self._tracker.complete_llm(pending)
         else:
@@ -559,7 +696,20 @@ class CyclesRunHooks(RunHooks[TContext]):
             )
 
     async def release_pending(self, reason: str = "agent_run_failed", *, run_id: str | None = None) -> None:
-        """Release pending reservations for one run, or all runs when omitted."""
-        all_pending = self._tracker.pop_run(run_id) if run_id is not None else self._tracker.pop_all()
+        """Release one run, inferring it only when the choice is unambiguous."""
+        resolved_run_id = run_id or _active_run_id.get()
+        if resolved_run_id is None:
+            pending_run_ids = self._tracker.pending_run_ids
+            if not pending_run_ids:
+                return
+            if len(pending_run_ids) > 1:
+                raise RuntimeError("run_id is required when multiple runs have pending reservations")
+            resolved_run_id = pending_run_ids[0]
+        all_pending = self._tracker.pop_run(resolved_run_id)
         for pending in all_pending:
+            await self._release_reservation(pending, reason)
+
+    async def release_all_pending(self, reason: str = "all_agent_runs_failed") -> None:
+        """Explicitly release every pending reservation across all runs."""
+        for pending in self._tracker.pop_all():
             await self._release_reservation(pending, reason)

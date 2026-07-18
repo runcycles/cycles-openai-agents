@@ -91,15 +91,24 @@ class TestReservationTracker:
         t = ReservationTracker()
         assert t.get_llm("run_1") is None
 
-    def test_llm_overwrite_returns_previous(self) -> None:
+    def test_distinct_llm_operations_do_not_overwrite(self) -> None:
         t = ReservationTracker()
-        p1 = _make_pending("__llm__", "res_1")
-        p2 = _make_pending("__llm__", "res_2")
+        p1 = _make_pending("__llm__", "res_1", operation_id="llm_1")
+        p2 = _make_pending("__llm__", "res_2", operation_id="llm_2")
         prev1 = t.register_llm(p1)
         assert prev1 is None
         prev2 = t.register_llm(p2)
-        assert prev2 is p1
-        assert t.get_llm("run_1") is p2
+        assert prev2 is None
+        assert t.get_llm("run_1") is p1
+        assert t.get_llm("run_1", operation_id="llm_2") is p2
+        assert t.pending_count("run_1") == 2
+
+    def test_exact_duplicate_llm_operation_returns_previous(self) -> None:
+        t = ReservationTracker()
+        p1 = _make_pending("__llm__", "res_1")
+        p2 = _make_pending("__llm__", "res_2")
+        assert t.register_llm(p1) is None
+        assert t.register_llm(p2) is p1
 
     def test_llms_for_concurrent_runs_do_not_overwrite(self) -> None:
         t = ReservationTracker()
@@ -109,6 +118,7 @@ class TestReservationTracker:
         assert t.register_llm(p2) is None
         assert t.get_llm("run_a") is p1
         assert t.get_llm("run_b") is p2
+        assert t.pending_run_ids == ("run_a", "run_b")
 
     def test_pending_reservation_has_started_at(self) -> None:
         p = _make_pending()

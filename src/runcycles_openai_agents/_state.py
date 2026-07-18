@@ -36,7 +36,7 @@ class ReservationTracker:
 
     def __init__(self) -> None:
         self._pending_tools: dict[tuple[str, str], PendingReservation] = {}
-        self._pending_llms: dict[str, PendingReservation] = {}
+        self._pending_llms: dict[tuple[str, str], PendingReservation] = {}
         self._operation_counts: dict[tuple[str, str], int] = {}
 
     def next_operation_id(self, run_id: str, kind: str) -> str:
@@ -81,29 +81,35 @@ class ReservationTracker:
         return True
 
     def register_llm(self, reservation: PendingReservation) -> PendingReservation | None:
-        """Store the current LLM operation for one run and return any duplicate."""
-        previous = self._pending_llms.get(reservation.run_id)
-        self._pending_llms[reservation.run_id] = reservation
+        """Store an LLM reservation, returning an exact duplicate if present."""
+        key = (reservation.run_id, reservation.operation_id)
+        previous = self._pending_llms.get(key)
+        self._pending_llms[key] = reservation
         return previous
 
-    def get_llm(self, run_id: str) -> PendingReservation | None:
-        """Return the pending LLM reservation for one run."""
-        return self._pending_llms.get(run_id)
+    def get_llm(self, run_id: str, *, operation_id: str | None = None) -> PendingReservation | None:
+        """Return an exact LLM operation or the oldest operation for one run."""
+        if operation_id is not None:
+            return self._pending_llms.get((run_id, operation_id))
+        return next(
+            (pending for (pending_run_id, _), pending in self._pending_llms.items() if pending_run_id == run_id),
+            None,
+        )
 
     def complete_llm(self, reservation: PendingReservation) -> bool:
         """Remove an LLM reservation after a confirmed commit."""
-        if self._pending_llms.get(reservation.run_id) is not reservation:
+        key = (reservation.run_id, reservation.operation_id)
+        if self._pending_llms.get(key) is not reservation:
             return False
-        del self._pending_llms[reservation.run_id]
+        del self._pending_llms[key]
         return True
 
     def pop_run(self, run_id: str) -> list[PendingReservation]:
         """Atomically detach every pending reservation belonging to one run."""
         tool_keys = [key for key in self._pending_tools if key[0] == run_id]
         result = [self._pending_tools.pop(key) for key in tool_keys]
-        pending_llm = self._pending_llms.pop(run_id, None)
-        if pending_llm is not None:
-            result.append(pending_llm)
+        llm_keys = [key for key in self._pending_llms if key[0] == run_id]
+        result.extend(self._pending_llms.pop(key) for key in llm_keys)
         self.forget_run(run_id)
         return result
 
@@ -124,7 +130,15 @@ class ReservationTracker:
     def pending_count(self, run_id: str) -> int:
         """Return the number of pending reservations for one run."""
         tool_count = sum(key[0] == run_id for key in self._pending_tools)
-        return tool_count + int(run_id in self._pending_llms)
+        llm_count = sum(key[0] == run_id for key in self._pending_llms)
+        return tool_count + llm_count
+
+    @property
+    def pending_run_ids(self) -> tuple[str, ...]:
+        """Return the run IDs that currently own pending reservations."""
+        run_ids = {run_id for run_id, _ in self._pending_tools}
+        run_ids.update(run_id for run_id, _ in self._pending_llms)
+        return tuple(sorted(run_ids))
 
     @property
     def pending_tool_count(self) -> int:

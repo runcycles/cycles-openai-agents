@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool and LLM calls. Set `fail_open=True` explicitly to retain the previous
   availability-first behavior. The `cycles_budget_guardrail` default is
   unchanged.
+- Calling `release_pending()` without a `run_id` no longer releases unrelated
+  concurrent runs. It infers the target only when one run is pending and raises
+  on ambiguity; use `release_all_pending()` for an intentional global cleanup.
 
 ### Added
 
@@ -22,21 +25,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CyclesRunHooks.run(...)`, an awaited SDK run-finalization wrapper that
   releases only that run's in-flight reservations before propagating an
   exception or `asyncio.CancelledError`.
+- `CyclesRunHooks.run_streamed(...)` and `CyclesRunResultStreaming`, which cover
+  streamed model errors, consumer cancellation, early stream closure, and
+  explicit `cancel()` even when events are never consumed.
 - Configurable heartbeat safety caps: `heartbeat_max_age_ms` defaults to 10
   minutes, and `heartbeat_max_extensions` can impose an additional count cap.
+- A production commit retry seam (`commit_max_attempts`, default 2) for
+  exceptions, transport failures, HTTP 429, and HTTP 5xx responses. Every
+  attempt reuses the same request and deterministic idempotency key.
 
 ### Fixed
 
 - Prevent orphaned reservations from being extended forever after tool/LLM
   failures or cancellation. Automatic cleanup now covers real runner failure
-  paths when using `hooks.run(...)`; bounded heartbeat expiry remains the
-  fallback if callers use bare `Runner.run(..., hooks=hooks)` without manual
-  cleanup.
+  paths when using `hooks.run(...)` or `hooks.run_streamed(...)`; bounded
+  heartbeat expiry remains the fallback if callers use bare SDK Runner methods
+  without manual cleanup.
 - Derive commit idempotency keys from the stable run ID and SDK operation ID
   (tool call ID or LLM span/sequence), and retain failed commits for safe replay
   with the same key.
 - Scope pending tools, LLM calls, operation counters, and cleanup by run and
   operation ID so one hooks instance can safely serve concurrent runs.
+- Prevent an unscoped manual cleanup from releasing reservations belonging to
+  other live runs.
 
 ## [0.2.1] — 2026-05-07
 

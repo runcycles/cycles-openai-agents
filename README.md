@@ -1,7 +1,7 @@
 [![PyPI](https://img.shields.io/pypi/v/runcycles-openai-agents?v=1)](https://pypi.org/project/runcycles-openai-agents/)
 [![PyPI Downloads](https://img.shields.io/pypi/dm/runcycles-openai-agents)](https://pypi.org/project/runcycles-openai-agents/)
 [![CI](https://github.com/runcycles/cycles-openai-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/runcycles/cycles-openai-agents/actions)
-[![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](https://github.com/runcycles/cycles-openai-agents)
+[![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](https://github.com/runcycles/cycles-openai-agents)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
 # OpenAI Agents SDK Budget Control — Cycles integration for Python
@@ -98,7 +98,7 @@ result = await hooks.run(agent, input="...")
 
 ### Hook lifecycle
 
-The hooks plug into the SDK's native `RunHooks` interface and govern the **entire agent run**. Use `hooks.run(...)` to add awaited cleanup at the SDK run-finalization boundary:
+The hooks plug into the SDK's native `RunHooks` interface and govern the **entire agent run**. Use `hooks.run(...)` for non-streaming runs or `hooks.run_streamed(...)` for streaming runs so cleanup is attached at the SDK run-finalization boundary:
 
 | Hook | Cycles API Call | Blocking | Detail |
 |------|----------------|----------|--------|
@@ -120,7 +120,15 @@ hooks = CyclesRunHooks(tenant="acme-corp", app="support-platform")
 result = await hooks.run(agent, input="...")
 ```
 
-The OpenAI Agents SDK does not expose a general `RunHooks.on_error` callback. If you call bare `Runner.run(..., hooks=hooks)`, automatic exception/cancellation cleanup cannot run; call `release_pending()` yourself in a `finally`/error path. Heartbeats are capped at 10 minutes by default, so a missed cleanup path eventually falls back to reservation TTL expiry instead of extending forever.
+Streaming runs receive the same protection. Consume the returned proxy's events, or call its synchronous `cancel()` method; either path waits for or schedules run-scoped cleanup:
+
+```python
+result = hooks.run_streamed(agent, input="...")
+async for event in result.stream_events():
+    handle(event)
+```
+
+The OpenAI Agents SDK does not expose a general `RunHooks.on_error` callback. If you call bare `Runner.run(..., hooks=hooks)` or `Runner.run_streamed(..., hooks=hooks)`, automatic exception/cancellation cleanup cannot run. In a single-run error path, call `release_pending()`; when multiple runs are pending it raises instead of guessing and releasing another run. Prefer the wrappers for concurrent runs because they carry a stable run ID into scoped cleanup. `release_all_pending()` is the explicit application-shutdown escape hatch. Heartbeats are capped at 10 minutes by default, so even a missed cleanup path eventually falls back to reservation TTL expiry instead of extending forever.
 
 When budget is denied, the hooks raise `BudgetExceededError`:
 
@@ -218,6 +226,7 @@ CyclesRunHooks(
     ttl_ms=60_000,              # reservation TTL (heartbeat extends at half-interval)
     heartbeat_max_age_ms=600_000, # stop extending after 10 minutes
     heartbeat_max_extensions=None, # optional additional extension-count cap
+    commit_max_attempts=2,      # retry transport, 429, and 5xx commit failures
     overage_policy=CommitOveragePolicy.ALLOW_IF_AVAILABLE,
     dry_run=False,              # shadow mode — no budget consumed
 )
@@ -231,7 +240,8 @@ CyclesRunHooks(
 - **Pre-run guardrail**: `/v1/decide` check before agent starts — zero tokens on DENY
 - **Handoff-aware**: Agent handoffs recorded as audit events in the Cycles ledger
 - **Bounded heartbeat**: TTL extension keeps active reservations alive but stops after a configurable maximum age
-- **Run-finalization cleanup**: `hooks.run()` releases run-scoped reservations on exceptions and cancellation; TTL expiry is the fallback
+- **Run-finalization cleanup**: `hooks.run()` and `hooks.run_streamed()` release run-scoped reservations on exceptions and cancellation; TTL expiry is the fallback
+- **Replay-safe commits**: Retryable commit failures reuse the same deterministic idempotency key and request
 - **Fail-closed by default**: Cycles transport and HTTP errors block governed operations; `fail_open=True` is explicit opt-in
 - **Environment config**: `CYCLES_BASE_URL` + `CYCLES_API_KEY` for zero-config setup
 - **Typed exceptions**: `BudgetExceededError` for precise error handling

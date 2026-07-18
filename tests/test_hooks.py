@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -95,6 +96,27 @@ class _ToolCallModel(Model):
         raise NotImplementedError
 
 
+class _FailingStreamingModel(Model):
+    def __init__(self, error: BaseException, *, block: bool = False) -> None:
+        self.error = error
+        self.started = asyncio.Event()
+        self.finish = asyncio.Event()
+        if not block:
+            self.finish.set()
+
+    async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        raise NotImplementedError
+
+    def stream_response(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        async def events() -> AsyncIterator[Any]:
+            self.started.set()
+            await self.finish.wait()
+            raise self.error
+            yield
+
+        return events()
+
+
 # --- Constructor ---
 
 
@@ -135,6 +157,7 @@ class TestConstructor:
         [
             ({"heartbeat_max_age_ms": 0}, "heartbeat_max_age_ms"),
             ({"heartbeat_max_extensions": 0}, "heartbeat_max_extensions"),
+            ({"commit_max_attempts": 0}, "commit_max_attempts"),
         ],
     )
     def test_invalid_heartbeat_caps_raise(
@@ -276,7 +299,7 @@ class TestOnToolEnd:
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
         await h.on_tool_end(mock_context, mock_agent, mock_tool, "result")
 
-        mock_client.commit_reservation.assert_awaited_once()
+        assert mock_client.commit_reservation.await_count == 2
 
 
 # --- on_llm_start ---
@@ -429,7 +452,7 @@ class TestOnLlmEnd:
         mock_response.usage.output_tokens = 5
         await h.on_llm_end(mock_context, mock_agent, mock_response)
 
-        mock_client.commit_reservation.assert_awaited_once()
+        assert mock_client.commit_reservation.await_count == 2
 
 
 # --- on_handoff ---
@@ -772,6 +795,71 @@ class TestRunnerLifecycleSafety:
         await asyncio.sleep(0)
         assert heartbeat_task.done()
 
+    async def test_streamed_llm_exception_releases_before_propagating(self, mock_client: AsyncMock) -> None:
+        mock_client.create_reservation.return_value = make_success_response(reservation_id="res_stream_error")
+        mock_client.release_reservation.return_value = make_commit_response()
+        h = _hooks(mock_client, ttl_ms=2000)
+        model = _FailingStreamingModel(RuntimeError("stream exploded"))
+        agent = Agent(name="stream-error", model=model)
+
+        result = h.run_streamed(agent, "hello", run_id="run-stream-error")
+        with pytest.raises(RuntimeError, match="stream exploded"):
+            async for _ in result.stream_events():
+                pass
+
+        mock_client.release_reservation.assert_awaited_once()
+        reservation_id, request = mock_client.release_reservation.call_args.args
+        assert reservation_id == "res_stream_error"
+        assert request.reason == "agent_run_failed:RuntimeError"
+        assert h._tracker.pending_count("run-stream-error") == 0
+
+    async def test_stream_consumer_cancellation_releases_before_propagating(self, mock_client: AsyncMock) -> None:
+        mock_client.create_reservation.return_value = make_success_response(reservation_id="res_stream_cancel")
+        mock_client.release_reservation.return_value = make_commit_response()
+        h = _hooks(mock_client, ttl_ms=2000)
+        model = _FailingStreamingModel(RuntimeError("should not escape"), block=True)
+        agent = Agent(name="stream-cancel", model=model)
+        result = h.run_streamed(agent, "wait", run_id="run-stream-cancel")
+
+        async def consume() -> None:
+            async for _ in result.stream_events():
+                pass
+
+        consumer = asyncio.create_task(consume())
+        await model.started.wait()
+        pending = h._tracker.get_llm("run-stream-cancel")
+        assert pending is not None
+        heartbeat_task = pending.heartbeat_task
+        assert heartbeat_task is not None
+        consumer.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+
+        mock_client.release_reservation.assert_awaited_once()
+        reservation_id, request = mock_client.release_reservation.call_args.args
+        assert reservation_id == "res_stream_cancel"
+        assert request.reason == "agent_run_cancelled"
+        await asyncio.sleep(0)
+        assert heartbeat_task.done()
+
+    async def test_stream_cancel_method_releases_without_consumption(self, mock_client: AsyncMock) -> None:
+        mock_client.create_reservation.return_value = make_success_response(reservation_id="res_stream_cancel_method")
+        mock_client.release_reservation.return_value = make_commit_response()
+        h = _hooks(mock_client, ttl_ms=0)
+        model = _FailingStreamingModel(RuntimeError("should not escape"), block=True)
+        agent = Agent(name="stream-cancel-method", model=model)
+        result = h.run_streamed(agent, "wait", run_id="run-stream-cancel-method")
+        await model.started.wait()
+
+        result.cancel()
+        assert result._cleanup_task is not None
+        await result._cleanup_task
+
+        mock_client.release_reservation.assert_awaited_once()
+        assert mock_client.release_reservation.call_args.args[1].reason == "agent_run_cancelled"
+        assert h._tracker.pending_count("run-stream-cancel-method") == 0
+
     async def test_concurrent_runs_on_one_hooks_instance_are_isolated(self, mock_client: AsyncMock) -> None:
         async def reserve(request: Any) -> Any:
             return make_success_response(reservation_id=f"res_{request.action.name}")
@@ -817,11 +905,9 @@ class TestCommitIdempotency:
 
         await h.on_tool_start(mock_context, mock_agent, mock_tool)
         await h.on_tool_end(mock_context, mock_agent, mock_tool, "result")
-        first_key = mock_client.commit_reservation.await_args_list[0].args[1].idempotency_key
-        assert h._tracker.pending_tool_count == 1
-
-        await h.on_tool_end(mock_context, mock_agent, mock_tool, "result")
-        second_key = mock_client.commit_reservation.await_args_list[1].args[1].idempotency_key
+        first_key, second_key = [
+            call.args[1].idempotency_key for call in mock_client.commit_reservation.await_args_list
+        ]
 
         assert first_key == second_key
         assert h._tracker.pending_tool_count == 0
@@ -829,26 +915,40 @@ class TestCommitIdempotency:
     async def test_llm_commit_retry_reuses_same_key(
         self,
         mock_client: AsyncMock,
-        mock_context: MagicMock,
-        mock_agent: MagicMock,
     ) -> None:
         mock_client.create_reservation.return_value = make_success_response(reservation_id="res_llm_retry")
         mock_client.commit_reservation.side_effect = [make_http_error(503), make_commit_response()]
         h = _hooks(mock_client, ttl_ms=0)
-        response = MagicMock()
-        response.usage.input_tokens = 10
-        response.usage.output_tokens = 5
+        model = _BlockingModel()
+        model.finish.set()
+        agent = Agent(name="llm-retry", model=model)
 
-        await h.on_llm_start(mock_context, mock_agent, None, [])
-        await h.on_llm_end(mock_context, mock_agent, response)
-        first_key = mock_client.commit_reservation.await_args_list[0].args[1].idempotency_key
-        assert h._tracker.has_pending_llm is True
+        result = await h.run(agent, "hello", run_id="run-llm-retry")
+        first_key, second_key = [
+            call.args[1].idempotency_key for call in mock_client.commit_reservation.await_args_list
+        ]
 
-        await h.on_llm_end(mock_context, mock_agent, response)
-        second_key = mock_client.commit_reservation.await_args_list[1].args[1].idempotency_key
-
+        assert result.final_output == "ok"
         assert first_key == second_key
         assert h._tracker.has_pending_llm is False
+
+    async def test_commit_exception_retry_reuses_same_request(
+        self,
+        mock_client: AsyncMock,
+        mock_context: MagicMock,
+        mock_agent: MagicMock,
+        mock_tool: MagicMock,
+    ) -> None:
+        mock_client.create_reservation.return_value = make_success_response(reservation_id="res_retry_exception")
+        mock_client.commit_reservation.side_effect = [ConnectionError("lost response"), make_commit_response()]
+        h = _hooks(mock_client, ttl_ms=0, tool_estimates={"test-tool": 10})
+
+        await h.on_tool_start(mock_context, mock_agent, mock_tool)
+        await h.on_tool_end(mock_context, mock_agent, mock_tool, "result")
+
+        first_request = mock_client.commit_reservation.await_args_list[0].args[1]
+        second_request = mock_client.commit_reservation.await_args_list[1].args[1]
+        assert first_request is second_request
 
 
 # --- release_pending ---
@@ -875,6 +975,37 @@ class TestReleasePending:
         h = _hooks(mock_client)
         await h.release_pending()
         mock_client.release_reservation.assert_not_awaited()
+
+    async def test_release_pending_requires_run_id_when_multiple_runs_are_active(
+        self,
+        mock_client: AsyncMock,
+        mock_agent: MagicMock,
+    ) -> None:
+        mock_client.create_reservation.side_effect = [
+            make_success_response(reservation_id="res_run_a"),
+            make_success_response(reservation_id="res_run_b"),
+        ]
+        mock_client.release_reservation.return_value = make_commit_response()
+        h = _hooks(mock_client, ttl_ms=0)
+        context_a = MagicMock()
+        context_a.usage = object()
+        context_b = MagicMock()
+        context_b.usage = object()
+
+        await h.on_llm_start(context_a, mock_agent, None, [])
+        await h.on_llm_start(context_b, mock_agent, None, [])
+
+        with pytest.raises(RuntimeError, match="run_id is required"):
+            await h.release_pending()
+
+        mock_client.release_reservation.assert_not_awaited()
+        assert len(h._tracker.pending_run_ids) == 2
+
+        await h.release_all_pending("test_shutdown")
+
+        assert mock_client.release_reservation.await_count == 2
+        assert {call.args[1].reason for call in mock_client.release_reservation.await_args_list} == {"test_shutdown"}
+        assert h._tracker.pending_run_ids == ()
 
     async def test_release_failure_does_not_raise(
         self, mock_client: AsyncMock, mock_context: MagicMock, mock_agent: MagicMock, mock_tool: MagicMock

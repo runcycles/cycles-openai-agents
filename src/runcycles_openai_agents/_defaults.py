@@ -14,6 +14,9 @@ DEFAULT_TTL_MS: int = 60_000
 DEFAULT_HEARTBEAT_MAX_AGE_MS: int = 600_000
 """Default maximum time to extend a reservation heartbeat (10 minutes)."""
 
+DEFAULT_COMMIT_MAX_ATTEMPTS: int = 2
+"""Default total attempts for a reservation commit."""
+
 DEFAULT_ACTION_KIND_TOOL: str = "tool.invoke"
 """Default action kind for tool calls."""
 

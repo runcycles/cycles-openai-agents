@@ -16,7 +16,7 @@ Prerequisites:
 
 import asyncio
 
-from agents import Agent, Runner, function_tool
+from agents import Agent, function_tool
 
 from runcycles_openai_agents import CyclesRunHooks, ToolEstimateConfig
 
@@ -57,10 +57,9 @@ async def main() -> None:
         tools=[send_email, search_knowledge, update_crm],
     )
 
-    result = await Runner.run(
+    result = await hooks.run(
         agent,
         input="Customer #123 can't log in. Search for a fix and email them the solution.",
-        hooks=hooks,
     )
     print(result.final_output)
 

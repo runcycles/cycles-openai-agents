@@ -32,7 +32,7 @@ The OpenAI Agents SDK gives you hooks and guardrails for content safety, but **n
 **This plugin fixes all of that with one line:**
 
 ```python
-result = await Runner.run(agent, input="...", hooks=CyclesRunHooks(tenant="acme"))
+result = await CyclesRunHooks(tenant="acme").run(agent, input="...")
 ```
 
 Every LLM call and every tool call in the entire agent run — including handoffs to sub-agents — automatically reserves budget before execution and commits actual usage after. If the budget is exhausted, the agent stops. No per-function decoration. No code changes to your tools.
@@ -46,7 +46,7 @@ Every LLM call and every tool call in the entire agent run — including handoff
 | No per-tenant limits | Pass `tenant="acme"` — Cycles enforces per-tenant budgets server-side. |
 | No pre-run check | `cycles_budget_guardrail` calls `/v1/decide` before the agent starts. Zero tokens consumed on DENY. |
 | No audit trail | Every reservation, commit, and handoff is recorded in the Cycles ledger. |
-| Agent runs forever | TTL heartbeat auto-extends reservations. If the agent dies, reservations expire and budget is released. |
+| Long-running or abandoned calls | TTL heartbeats extend active reservations for at most 10 minutes by default. Cleanup releases known reservations; a missed cleanup path still degrades to TTL expiry. |
 
 ## Installation
 
@@ -70,7 +70,7 @@ export CYCLES_API_KEY=cyc_live_...
 ## Quick Start
 
 ```python
-from agents import Agent, Runner
+from agents import Agent
 from runcycles_openai_agents import CyclesRunHooks, cycles_budget_guardrail
 
 # Pre-run budget check — agent never starts if budget exhausted
@@ -93,12 +93,12 @@ agent = Agent(
     input_guardrails=[guardrail],
 )
 
-result = await Runner.run(agent, input="...", hooks=hooks)
+result = await hooks.run(agent, input="...")
 ```
 
 ### Hook lifecycle
 
-The hooks plug into the SDK's native `RunHooks` interface and govern the **entire agent run** automatically:
+The hooks plug into the SDK's native `RunHooks` interface and govern the **entire agent run**. Use `hooks.run(...)` to add awaited cleanup at the SDK run-finalization boundary:
 
 | Hook | Cycles API Call | Blocking | Detail |
 |------|----------------|----------|--------|
@@ -112,17 +112,15 @@ All raised exceptions from budget denial trigger `BudgetExceededError`. See [Err
 
 ## Error handling
 
-If `Runner.run()` raises, pending reservations stay locked until TTL expires. Call `release_pending()` to free them immediately:
+`CyclesRunHooks.run()` releases reservations scoped to that run before re-raising an exception or `asyncio.CancelledError`:
 
 ```python
 hooks = CyclesRunHooks(tenant="acme-corp", app="support-platform")
 
-try:
-    result = await Runner.run(agent, input="...", hooks=hooks)
-except Exception:
-    await hooks.release_pending("agent_run_failed")
-    raise
+result = await hooks.run(agent, input="...")
 ```
+
+The OpenAI Agents SDK does not expose a general `RunHooks.on_error` callback. If you call bare `Runner.run(..., hooks=hooks)`, automatic exception/cancellation cleanup cannot run; call `release_pending()` yourself in a `finally`/error path. Heartbeats are capped at 10 minutes by default, so a missed cleanup path eventually falls back to reservation TTL expiry instead of extending forever.
 
 When budget is denied, the hooks raise `BudgetExceededError`:
 
@@ -130,7 +128,7 @@ When budget is denied, the hooks raise `BudgetExceededError`:
 from runcycles import BudgetExceededError
 
 try:
-    result = await Runner.run(agent, input="...", hooks=hooks)
+    result = await hooks.run(agent, input="...")
 except BudgetExceededError as e:
     print(f"Budget denied: {e}")
     # Agent stopped — no further tokens consumed
@@ -194,10 +192,10 @@ hooks = CyclesRunHooks(client=client, tenant="acme-corp")
 
 ### Fail-open / fail-closed
 
-By default, if the Cycles server is unreachable the agent continues (`fail_open=True`). Set `fail_open=False` to enforce strict governance:
+Hooks are fail-closed by default (`fail_open=False`): if the Cycles server is unreachable, the governed operation is blocked. Availability-first behavior remains an explicit opt-in:
 
 ```python
-hooks = CyclesRunHooks(tenant="acme", fail_open=False)
+hooks = CyclesRunHooks(tenant="acme", fail_open=True)
 ```
 
 ### All options
@@ -216,8 +214,10 @@ CyclesRunHooks(
     default_tool_estimate=1,    # estimate for unmapped tools (in default unit)
     llm_estimate=500_000,       # per-LLM-call estimate (~$0.005 in USD_MICROCENTS)
     llm_unit=Unit.USD_MICROCENTS,
-    fail_open=True,             # allow execution if Cycles is down
+    fail_open=False,            # block execution if Cycles is down (default)
     ttl_ms=60_000,              # reservation TTL (heartbeat extends at half-interval)
+    heartbeat_max_age_ms=600_000, # stop extending after 10 minutes
+    heartbeat_max_extensions=None, # optional additional extension-count cap
     overage_policy=CommitOveragePolicy.ALLOW_IF_AVAILABLE,
     dry_run=False,              # shadow mode — no budget consumed
 )
@@ -230,9 +230,9 @@ CyclesRunHooks(
 - **LLM governance**: Every LLM call reserves and commits with real token metrics
 - **Pre-run guardrail**: `/v1/decide` check before agent starts — zero tokens on DENY
 - **Handoff-aware**: Agent handoffs recorded as audit events in the Cycles ledger
-- **Automatic heartbeat**: TTL extension keeps reservations alive during long operations
-- **Fail-safe cleanup**: `release_pending()` frees locked budget when agent runs fail
-- **Fail-open by default**: Agent continues if Cycles server is unreachable
+- **Bounded heartbeat**: TTL extension keeps active reservations alive but stops after a configurable maximum age
+- **Run-finalization cleanup**: `hooks.run()` releases run-scoped reservations on exceptions and cancellation; TTL expiry is the fallback
+- **Fail-closed by default**: Cycles transport and HTTP errors block governed operations; `fail_open=True` is explicit opt-in
 - **Environment config**: `CYCLES_BASE_URL` + `CYCLES_API_KEY` for zero-config setup
 - **Typed exceptions**: `BudgetExceededError` for precise error handling
 

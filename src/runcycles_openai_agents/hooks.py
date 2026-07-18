@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import hashlib
 import logging
 import uuid
+from time import monotonic
 from typing import Any, TypeVar
 
-from agents import Agent, AgentHookContext, ModelResponse, RunContextWrapper, RunHooks, Tool
+from agents import Agent, AgentHookContext, ModelResponse, RunContextWrapper, RunHooks, Runner, Tool
 from agents.items import TResponseInputItem
+from agents.tracing import get_current_span, get_current_trace
 from runcycles import (
     Action,
     Amount,
@@ -29,6 +33,7 @@ from runcycles import (
 from runcycles_openai_agents._defaults import (
     DEFAULT_ACTION_KIND_HANDOFF,
     DEFAULT_ACTION_KIND_LLM,
+    DEFAULT_HEARTBEAT_MAX_AGE_MS,
     DEFAULT_LLM_ESTIMATE,
     DEFAULT_TTL_MS,
 )
@@ -38,6 +43,11 @@ from runcycles_openai_agents.tool_estimate_map import ToolEstimateConfig, ToolEs
 logger = logging.getLogger(__name__)
 
 TContext = TypeVar("TContext")
+
+_active_run_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "cycles_openai_agents_run_id",
+    default=None,
+)
 
 
 class CyclesRunHooks(RunHooks[TContext]):
@@ -51,7 +61,7 @@ class CyclesRunHooks(RunHooks[TContext]):
             app="support-platform",
             tool_estimates={"send_email": 50, "search": 0},
         )
-        result = await Runner.run(agent, input="...", hooks=hooks)
+        result = await hooks.run(agent, input="...")
     """
 
     def __init__(
@@ -72,8 +82,10 @@ class CyclesRunHooks(RunHooks[TContext]):
         llm_estimate: int = DEFAULT_LLM_ESTIMATE,
         llm_unit: Unit = Unit.USD_MICROCENTS,
         # Behaviour
-        fail_open: bool = True,
+        fail_open: bool = False,
         ttl_ms: int = DEFAULT_TTL_MS,
+        heartbeat_max_age_ms: int = DEFAULT_HEARTBEAT_MAX_AGE_MS,
+        heartbeat_max_extensions: int | None = None,
         overage_policy: CommitOveragePolicy | str = CommitOveragePolicy.ALLOW_IF_AVAILABLE,
         dry_run: bool = False,
     ) -> None:
@@ -100,13 +112,18 @@ class CyclesRunHooks(RunHooks[TContext]):
         self._llm_unit = llm_unit
         self._fail_open = fail_open
         self._ttl_ms = ttl_ms
+        if heartbeat_max_age_ms <= 0:
+            raise ValueError("heartbeat_max_age_ms must be greater than zero")
+        if heartbeat_max_extensions is not None and heartbeat_max_extensions <= 0:
+            raise ValueError("heartbeat_max_extensions must be greater than zero when set")
+        self._heartbeat_max_age_ms = heartbeat_max_age_ms
+        self._heartbeat_max_extensions = heartbeat_max_extensions
         self._overage_policy = (
             overage_policy if isinstance(overage_policy, CommitOveragePolicy) else CommitOveragePolicy(overage_policy)
         )
         self._dry_run = dry_run
 
         self._tracker = ReservationTracker()
-        self._current_agent_name: str | None = agent
 
     # --- helpers ---
 
@@ -116,15 +133,73 @@ class CyclesRunHooks(RunHooks[TContext]):
             workspace=self._workspace,
             app=self._app,
             workflow=self._workflow,
-            agent=agent_name or self._current_agent_name,
+            agent=agent_name or self._agent,
             toolset=toolset_name or self._toolset,
         )
 
     @staticmethod
-    def _idem() -> str:
-        return uuid.uuid4().hex
+    def _idempotency_key(run_id: str, operation: str, operation_id: str) -> str:
+        value = f"cycles-openai-agents\0{run_id}\0{operation}\0{operation_id}"
+        return hashlib.sha256(value.encode()).hexdigest()
 
-    def _start_heartbeat(self, reservation_id: str) -> asyncio.Task[None] | None:
+    @staticmethod
+    def _run_id(context: RunContextWrapper[Any]) -> str:
+        active_run_id = _active_run_id.get()
+        if active_run_id is not None:
+            return active_run_id
+        trace = get_current_trace()
+        trace_id = trace.trace_id if trace is not None else "untraced"
+        return f"{trace_id}:{id(context.usage):x}"
+
+    @staticmethod
+    def _span_id() -> str | None:
+        span = get_current_span()
+        return span.span_id if span is not None else None
+
+    @staticmethod
+    def _tool_call_id(context: RunContextWrapper[Any]) -> str | None:
+        call_id = getattr(context, "tool_call_id", None)
+        return call_id if isinstance(call_id, str) and call_id else None
+
+    async def run(
+        self,
+        starting_agent: Agent[TContext],
+        input: Any,
+        *,
+        run_id: str | None = None,
+        **runner_kwargs: Any,
+    ) -> Any:
+        """Run an agent with failure- and cancellation-safe reservation cleanup.
+
+        The OpenAI Agents SDK does not expose a general error hook, so this method
+        wraps ``Runner.run`` at its finalization boundary. Callers may supply an
+        application run ID for stable operation correlation.
+        """
+        if "hooks" in runner_kwargs:
+            raise ValueError("CyclesRunHooks.run() manages the hooks argument")
+
+        effective_run_id = run_id or uuid.uuid4().hex
+        token = _active_run_id.set(effective_run_id)
+        try:
+            return await Runner.run(starting_agent, input, hooks=self, **runner_kwargs)
+        except asyncio.CancelledError:
+            await self.release_pending("agent_run_cancelled", run_id=effective_run_id)
+            raise
+        except BaseException as exc:
+            reason = f"agent_run_failed:{type(exc).__name__}"
+            await self.release_pending(reason, run_id=effective_run_id)
+            raise
+        finally:
+            self._tracker.forget_run(effective_run_id)
+            _active_run_id.reset(token)
+
+    def _start_heartbeat(
+        self,
+        reservation_id: str,
+        *,
+        run_id: str,
+        operation_id: str,
+    ) -> asyncio.Task[None] | None:
         """Spawn a background task that extends the reservation at half-TTL intervals.
 
         Heartbeat is disabled when ``ttl_ms`` is too small (< 2000ms) because the
@@ -135,12 +210,33 @@ class CyclesRunHooks(RunHooks[TContext]):
         interval_s = max(self._ttl_ms / 2, 1000) / 1000.0
 
         async def _loop() -> None:
+            started_at = monotonic()
+            extension_count = 0
             try:
                 while True:
-                    await asyncio.sleep(interval_s)
+                    if self._heartbeat_max_extensions is not None and extension_count >= self._heartbeat_max_extensions:
+                        logger.warning(
+                            "cycles: heartbeat extension cap reached reservation=%s extensions=%s",
+                            reservation_id,
+                            extension_count,
+                        )
+                        return
+                    remaining_s = self._heartbeat_max_age_ms / 1000.0 - (monotonic() - started_at)
+                    if remaining_s <= 0:
+                        logger.warning("cycles: heartbeat max age reached reservation=%s", reservation_id)
+                        return
+                    await asyncio.sleep(min(interval_s, remaining_s))
+                    if monotonic() - started_at >= self._heartbeat_max_age_ms / 1000.0:
+                        logger.warning("cycles: heartbeat max age reached reservation=%s", reservation_id)
+                        return
+                    extension_count += 1
                     try:
                         request = ReservationExtendRequest(
-                            idempotency_key=self._idem(),
+                            idempotency_key=self._idempotency_key(
+                                run_id,
+                                "heartbeat",
+                                f"{operation_id}:{extension_count}",
+                            ),
                             extend_by_ms=self._ttl_ms,
                         )
                         response = await self._client.extend_reservation(reservation_id, request)
@@ -159,7 +255,14 @@ class CyclesRunHooks(RunHooks[TContext]):
         """Release a reservation and cancel its heartbeat."""
         pending.cancel_heartbeat()
         try:
-            request = ReleaseRequest(idempotency_key=self._idem(), reason=reason)
+            request = ReleaseRequest(
+                idempotency_key=self._idempotency_key(
+                    pending.run_id,
+                    "release",
+                    f"{pending.operation_id}:{pending.reservation_id}",
+                ),
+                reason=reason,
+            )
             response = await self._client.release_reservation(pending.reservation_id, request)
             if not response.is_success:
                 logger.warning(
@@ -177,8 +280,7 @@ class CyclesRunHooks(RunHooks[TContext]):
         context: AgentHookContext[TContext],
         agent: Agent[TContext],
     ) -> None:
-        self._current_agent_name = agent.name
-        logger.debug("cycles: agent_start agent=%s", agent.name)
+        logger.debug("cycles: agent_start run=%s agent=%s", self._run_id(context), agent.name)
 
     async def on_agent_end(
         self,
@@ -186,7 +288,9 @@ class CyclesRunHooks(RunHooks[TContext]):
         agent: Agent[TContext],
         output: Any,
     ) -> None:
-        logger.debug("cycles: agent_end agent=%s", agent.name)
+        run_id = self._run_id(context)
+        logger.debug("cycles: agent_end run=%s agent=%s", run_id, agent.name)
+        await self.release_pending("agent_run_completed_with_pending_reservations", run_id=run_id)
 
     async def on_tool_start(
         self,
@@ -198,9 +302,14 @@ class CyclesRunHooks(RunHooks[TContext]):
             logger.debug("cycles: tool_start skip zero-estimate tool=%s", tool.name)
             return
 
+        run_id = self._run_id(context)
+        call_id = self._tool_call_id(context)
+        operation_id = (
+            f"tool:{call_id}" if call_id is not None else self._tracker.next_operation_id(run_id, f"tool:{tool.name}")
+        )
         est_cfg = self._tool_estimate_map.get(tool.name)
         request = ReservationCreateRequest(
-            idempotency_key=self._idem(),
+            idempotency_key=self._idempotency_key(run_id, "reserve", operation_id),
             subject=self._subject(agent_name=agent.name, toolset_name=tool.name),
             action=Action(kind=est_cfg.action_kind, name=tool.name),
             estimate=Amount(unit=est_cfg.unit, amount=est_cfg.estimate),
@@ -250,14 +359,25 @@ class CyclesRunHooks(RunHooks[TContext]):
             return
 
         pending = PendingReservation(
+            run_id=run_id,
+            operation_id=operation_id,
             reservation_id=reservation_id,
             tool_name=tool.name,
             agent_name=agent.name,
             estimate=est_cfg.estimate,
             unit=est_cfg.unit,
-            heartbeat_task=self._start_heartbeat(reservation_id),
+            commit_idempotency_key=self._idempotency_key(run_id, "commit", operation_id),
+            heartbeat_task=self._start_heartbeat(
+                reservation_id,
+                run_id=run_id,
+                operation_id=operation_id,
+            ),
         )
-        self._tracker.register_tool(tool.name, pending)
+        previous = self._tracker.register_tool(pending)
+        if previous is not None:
+            previous.cancel_heartbeat()
+            if previous.reservation_id != pending.reservation_id:
+                await self._release_reservation(previous, "duplicate_tool_operation_replaced")
         logger.debug("cycles: tool_start reserved=%s tool=%s", reservation_id, tool.name)
 
     async def on_tool_end(
@@ -271,17 +391,25 @@ class CyclesRunHooks(RunHooks[TContext]):
         # openai-agents base widened it from `str`); narrowing it here violates
         # the Liskov override rule (mypy >=2.1). We don't read `result` — the
         # commit amount comes from the tracked reservation estimate.
-        pending = self._tracker.pop_tool(tool.name)
+        run_id = self._run_id(context)
+        call_id = self._tool_call_id(context)
+        pending = self._tracker.get_tool(
+            run_id,
+            operation_id=f"tool:{call_id}" if call_id is not None else None,
+            tool_name=tool.name,
+        )
         if pending is None:
             return
 
         pending.cancel_heartbeat()
         commit = CommitRequest(
-            idempotency_key=self._idem(),
+            idempotency_key=pending.commit_idempotency_key,
             actual=Amount(unit=pending.unit, amount=pending.estimate),
         )
         response = await self._client.commit_reservation(pending.reservation_id, commit)
-        if not response.is_success:
+        if response.is_success:
+            self._tracker.complete_tool(pending)
+        else:
             logger.error(
                 "cycles: commit failed reservation=%s tool=%s err=%s",
                 pending.reservation_id,
@@ -296,8 +424,12 @@ class CyclesRunHooks(RunHooks[TContext]):
         system_prompt: str | None,
         input_items: list[TResponseInputItem],
     ) -> None:
+        run_id = self._run_id(context)
+        sequence_id = self._tracker.next_operation_id(run_id, "llm")
+        span_id = self._span_id() or agent.name
+        operation_id = f"llm:{span_id}:{sequence_id}"
         request = ReservationCreateRequest(
-            idempotency_key=self._idem(),
+            idempotency_key=self._idempotency_key(run_id, "reserve", operation_id),
             subject=self._subject(agent_name=agent.name),
             action=Action(kind=DEFAULT_ACTION_KIND_LLM, name=agent.name),
             estimate=Amount(unit=self._llm_unit, amount=self._llm_estimate),
@@ -343,17 +475,28 @@ class CyclesRunHooks(RunHooks[TContext]):
             return
 
         pending = PendingReservation(
+            run_id=run_id,
+            operation_id=operation_id,
             reservation_id=reservation_id,
             tool_name="__llm__",
             agent_name=agent.name,
             estimate=self._llm_estimate,
             unit=self._llm_unit,
-            heartbeat_task=self._start_heartbeat(reservation_id),
+            commit_idempotency_key=self._idempotency_key(run_id, "commit", operation_id),
+            heartbeat_task=self._start_heartbeat(
+                reservation_id,
+                run_id=run_id,
+                operation_id=operation_id,
+            ),
         )
         previous = self._tracker.register_llm(pending)
         if previous is not None:
-            logger.warning("cycles: overwriting pending LLM reservation=%s", previous.reservation_id)
-            await self._release_reservation(previous, "overwritten_by_new_llm_call")
+            logger.warning(
+                "cycles: replacing duplicate LLM operation run=%s reservation=%s",
+                run_id,
+                previous.reservation_id,
+            )
+            await self._release_reservation(previous, "duplicate_llm_operation_replaced")
         logger.debug("cycles: llm_start reserved=%s agent=%s", reservation_id, agent.name)
 
     async def on_llm_end(
@@ -362,7 +505,7 @@ class CyclesRunHooks(RunHooks[TContext]):
         agent: Agent[TContext],
         response: ModelResponse,
     ) -> None:
-        pending = self._tracker.pop_llm()
+        pending = self._tracker.get_llm(self._run_id(context))
         if pending is None:
             return
 
@@ -375,12 +518,14 @@ class CyclesRunHooks(RunHooks[TContext]):
             actual_amount = tokens_in + tokens_out
 
         commit = CommitRequest(
-            idempotency_key=self._idem(),
+            idempotency_key=pending.commit_idempotency_key,
             actual=Amount(unit=pending.unit, amount=actual_amount),
             metrics=CyclesMetrics(tokens_input=tokens_in, tokens_output=tokens_out),
         )
         resp = await self._client.commit_reservation(pending.reservation_id, commit)
-        if not resp.is_success:
+        if resp.is_success:
+            self._tracker.complete_llm(pending)
+        else:
             logger.error(
                 "cycles: LLM commit failed reservation=%s err=%s",
                 pending.reservation_id,
@@ -393,11 +538,12 @@ class CyclesRunHooks(RunHooks[TContext]):
         from_agent: Agent[TContext],
         to_agent: Agent[TContext],
     ) -> None:
-        self._current_agent_name = to_agent.name
         logger.debug("cycles: handoff from=%s to=%s", from_agent.name, to_agent.name)
 
+        run_id = self._run_id(context)
+        operation_id = self._tracker.next_operation_id(run_id, "handoff")
         request = EventCreateRequest(
-            idempotency_key=self._idem(),
+            idempotency_key=self._idempotency_key(run_id, "event", operation_id),
             subject=self._subject(agent_name=from_agent.name),
             action=Action(kind=DEFAULT_ACTION_KIND_HANDOFF, name=to_agent.name),
             actual=Amount(unit=Unit.RISK_POINTS, amount=0),
@@ -412,12 +558,8 @@ class CyclesRunHooks(RunHooks[TContext]):
                 response.error_message,
             )
 
-    async def release_pending(self, reason: str = "agent_run_failed") -> None:
-        """Release all pending reservations.  Call this when the agent run
-        fails and ``on_tool_end`` / ``on_llm_end`` won't fire.
-        """
-        pending_tools = self._tracker.pop_all_tools()
-        pending_llm = self._tracker.pop_llm()
-        all_pending = pending_tools + ([pending_llm] if pending_llm else [])
+    async def release_pending(self, reason: str = "agent_run_failed", *, run_id: str | None = None) -> None:
+        """Release pending reservations for one run, or all runs when omitted."""
+        all_pending = self._tracker.pop_run(run_id) if run_id is not None else self._tracker.pop_all()
         for pending in all_pending:
             await self._release_reservation(pending, reason)

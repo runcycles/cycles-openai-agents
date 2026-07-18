@@ -11,6 +11,9 @@ DEFAULT_TOOL_ESTIMATE: int = 1
 DEFAULT_TTL_MS: int = 60_000
 """Default reservation time-to-live in milliseconds."""
 
+DEFAULT_HEARTBEAT_MAX_AGE_MS: int = 600_000
+"""Default maximum time to extend a reservation heartbeat (10 minutes)."""
+
 DEFAULT_ACTION_KIND_TOOL: str = "tool.invoke"
 """Default action kind for tool calls."""
 

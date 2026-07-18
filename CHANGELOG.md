@@ -7,10 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **`CyclesRunHooks` is now fail-closed by default.** `fail_open` changed from
+  `True` to `False`, so Cycles transport and HTTP failures now block governed
+  tool and LLM calls. Set `fail_open=True` explicitly to retain the previous
+  availability-first behavior. The `cycles_budget_guardrail` default is
+  unchanged.
+
 ### Added
 
 - Repository `CODEOWNERS` for required-review routing.
 - Least-privilege `permissions:` blocks on CI workflows.
+- `CyclesRunHooks.run(...)`, an awaited SDK run-finalization wrapper that
+  releases only that run's in-flight reservations before propagating an
+  exception or `asyncio.CancelledError`.
+- Configurable heartbeat safety caps: `heartbeat_max_age_ms` defaults to 10
+  minutes, and `heartbeat_max_extensions` can impose an additional count cap.
+
+### Fixed
+
+- Prevent orphaned reservations from being extended forever after tool/LLM
+  failures or cancellation. Automatic cleanup now covers real runner failure
+  paths when using `hooks.run(...)`; bounded heartbeat expiry remains the
+  fallback if callers use bare `Runner.run(..., hooks=hooks)` without manual
+  cleanup.
+- Derive commit idempotency keys from the stable run ID and SDK operation ID
+  (tool call ID or LLM span/sequence), and retain failed commits for safe replay
+  with the same key.
+- Scope pending tools, LLM calls, operation counters, and cleanup by run and
+  operation ID so one hooks instance can safely serve concurrent runs.
 
 ## [0.2.1] — 2026-05-07
 

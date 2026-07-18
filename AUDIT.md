@@ -1,9 +1,9 @@
 # Cycles OpenAI Agents SDK Integration — Audit
 
-**Date:** 2026-04-02
-**Package:** `runcycles-openai-agents` v0.2.0
+**Date:** 2026-07-18
+**Package:** `runcycles-openai-agents` v0.2.1 + unreleased lifecycle fixes
 **OpenAI Agents SDK:** v0.13.2
-**Cycles Client:** `runcycles` v0.2.0
+**Cycles Client:** `runcycles` v0.4.1
 **Protocol Spec:** `cycles-protocol-v0.yaml` (v0.1.24)
 
 ---
@@ -17,13 +17,15 @@
 | Cycles API calls (reserve/commit/release/decide/event) | 6/6 | 0 |
 | Model constructors (field names, required fields) | 7/7 | 0 |
 | Amount constructions (unit, amount fields) | 6/6 | 0 |
-| Error handling (fail-open/fail-closed, DENY, transport) | 6/6 | 0 |
-| Reservation lifecycle (heartbeat, release on failure) | 4/4 | 0 |
+| Error handling (fail-open/fail-closed, DENY, transport) | 7/7 | 0 |
+| Reservation lifecycle (bounded heartbeat, exception/cancellation cleanup) | 8/8 | 0 |
+| Concurrent-run state isolation | 2/2 | 0 |
+| Commit idempotency replay | 2/2 | 0 |
 | Protocol terminology alignment | — | 0 |
-| Test coverage | — | 0 (100%, threshold 95%) |
+| Test coverage | — | 0 (97.78%, threshold 95%) |
 | Type safety (mypy strict) | — | 0 |
 
-**Overall: Integration is SDK-conformant, protocol-conformant, and terminology-aligned.** All hook signatures match the OpenAI Agents SDK `RunHooksBase` class. All Cycles API calls use correct model constructors with valid field names. Terminology follows the protocol's unit-agnostic `Amount(unit, amount)` / `estimate` / `actual` model.
+**Overall: Integration is SDK-conformant, protocol-conformant, lifecycle-safe through the documented run wrapper, and terminology-aligned.** The SDK exposes no general `RunHooks.on_error` callback; `CyclesRunHooks.run()` therefore wraps `Runner.run()` at its awaited finalization boundary. Bare `Runner.run(..., hooks=hooks)` still requires caller-managed error cleanup, but the bounded heartbeat ensures a missed path degrades to TTL expiry instead of an immortal reservation.
 
 ---
 
@@ -37,7 +39,9 @@ Verified the following across OpenAI Agents SDK source, Cycles protocol spec, an
 - All 7 model constructors (field names, required fields, types)
 - All 6 `Amount()` constructions (correct `unit` and `amount` fields)
 - Error handling paths (transport error, HTTP error, DENY decision)
-- Reservation lifecycle (heartbeat extension, release on failure)
+- Reservation lifecycle (bounded heartbeat, exception/cancellation release, TTL fallback)
+- Deterministic commit idempotency across ambiguous retry attempts
+- One hooks instance serving concurrent runs without cross-run overwrite or cleanup
 - Terminology consistency with protocol spec (`estimate`, `actual`, `Amount`)
 
 ---
@@ -80,7 +84,7 @@ Verified against `InputGuardrail.run()` in `agents/guardrail.py:120` which calls
 |----------|------|-------|----------------|-------|
 | `create_reservation` | `on_tool_start`, `on_llm_start` | `ReservationCreateRequest` | `idempotency_key, subject, action, estimate` | PASS |
 | `commit_reservation` | `on_tool_end`, `on_llm_end` | `CommitRequest` | `idempotency_key, actual` | PASS |
-| `release_reservation` | `release_pending` | `ReleaseRequest` | `idempotency_key` | PASS |
+| `release_reservation` | `CyclesRunHooks.run`, `on_agent_end`, `release_pending` | `ReleaseRequest` | `idempotency_key` | PASS |
 | `extend_reservation` | heartbeat task | `ReservationExtendRequest` | `idempotency_key, extend_by_ms` | PASS |
 | `decide` | `cycles_budget_guardrail` | `DecisionRequest` | `idempotency_key, subject, action, estimate` | PASS |
 | `create_event` | `on_handoff` | `EventCreateRequest` | `idempotency_key, subject, action, actual` | PASS |
@@ -126,6 +130,7 @@ All 6 `Amount()` constructions verified against protocol spec:
 | HTTP error + `fail_open=False` | Raise `BudgetExceededError` | PASS |
 | DENY decision (tool/LLM) | Raise `BudgetExceededError` | PASS |
 | DENY decision (guardrail) | Return `tripwire_triggered=True` | PASS |
+| Hooks default | `fail_open=False`; `True` remains explicit opt-in | PASS |
 
 ---
 
@@ -134,9 +139,28 @@ All 6 `Amount()` constructions verified against protocol spec:
 | Feature | Implementation | Match |
 |---------|---------------|-------|
 | Heartbeat (TTL extension) | `asyncio.Task` at `max(ttl_ms/2, 1000)ms` intervals using `extend_reservation` | PASS |
+| Heartbeat maximum age | Stops extending after configurable `heartbeat_max_age_ms` (default 600,000 ms) | PASS |
+| Heartbeat extension count | Optional `heartbeat_max_extensions` stops after N extensions | PASS |
 | Heartbeat cancellation | `cancel_heartbeat()` on `on_tool_end` / `on_llm_end` | PASS |
-| Release on failure | `release_pending()` releases all pending reservations and cancels heartbeats | PASS |
+| Exception cleanup | `CyclesRunHooks.run()` releases the failing run before re-raising | PASS |
+| Cancellation cleanup | `CyclesRunHooks.run()` releases with `agent_run_cancelled` before propagating `CancelledError` | PASS |
+| Success anomaly cleanup | `on_agent_end` releases only unexpected leftovers for its run | PASS |
+| Direct SDK fallback | Bounded heartbeat stops; reservation then expires by TTL if caller misses manual cleanup | PASS |
 | Zero-estimate tool skip | Tools with `estimate=0` bypass reservation entirely | PASS |
+
+### Run and operation correlation
+
+- Each `CyclesRunHooks.run()` invocation has an isolated run ID carried through
+  SDK hook tasks with a `ContextVar`.
+- Tool operations use the SDK `tool_call_id`; LLM operations use the current
+  span plus a run-scoped sequence. Legacy direct-hook calls fall back to the
+  current trace/context identity.
+- Pending reservations and counters are keyed by run and operation, so two
+  concurrent runs on one hooks instance cannot overwrite each other's live LLM
+  or tool reservation.
+- Commit idempotency keys are SHA-256 derivations of run ID, operation type,
+  and operation ID. A failed commit remains pending, and replay uses the exact
+  same key before state is removed on confirmed success.
 
 ---
 
@@ -160,13 +184,13 @@ No references to deprecated terminology (`risk_points`, `tool_risk`, `is_zero_co
 ## Test Coverage
 
 ```
-97 tests, 100% coverage (threshold: 95%)
+110 tests, 97.78% coverage (threshold: 95%)
 
 src/runcycles_openai_agents/__init__.py        100%
 src/runcycles_openai_agents/_defaults.py       100%
-src/runcycles_openai_agents/_state.py          100%
+src/runcycles_openai_agents/_state.py           99%
 src/runcycles_openai_agents/guardrail.py       100%
-src/runcycles_openai_agents/hooks.py           100%
+src/runcycles_openai_agents/hooks.py            97%
 src/runcycles_openai_agents/tool_estimate_map.py  100%
 ```
 
@@ -174,7 +198,7 @@ src/runcycles_openai_agents/tool_estimate_map.py  100%
 
 ## Verdict
 
-The integration is **fully conformant** with the OpenAI Agents SDK v0.13.2 hook/guardrail API, the Cycles Protocol v0.1.24 reservation lifecycle, and the protocol's unit-agnostic terminology. All model constructors, field names, Amount constructions, and API call patterns match the respective source code. Terminology is consistent across source, tests, examples, and documentation. No open issues.
+The integration is **conformant** with the OpenAI Agents SDK v0.13.2 hook/guardrail API, the Cycles Protocol v0.1.24 reservation lifecycle, and the protocol's unit-agnostic terminology. Real `Runner` tests cover LLM exceptions, propagated tool exceptions, `asyncio.CancelledError`, and concurrent runs sharing one hooks instance. Commit replay uses stable keys, heartbeat lifetime is bounded, and fail-closed governance is now the hooks default. The documented limitation is explicit: automatic exception/cancellation release requires `CyclesRunHooks.run()` because the SDK's bare hooks interface has no general error callback.
 
 ---
 

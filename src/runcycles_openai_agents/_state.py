@@ -37,6 +37,8 @@ class ReservationTracker:
     def __init__(self) -> None:
         self._pending_tools: dict[tuple[str, str], PendingReservation] = {}
         self._pending_llms: dict[tuple[str, str], PendingReservation] = {}
+        self._settling_tools: dict[tuple[str, str], PendingReservation] = {}
+        self._settling_llms: dict[tuple[str, str], PendingReservation] = {}
         self._operation_counts: dict[tuple[str, str], int] = {}
 
     def next_operation_id(self, run_id: str, kind: str) -> str:
@@ -50,6 +52,8 @@ class ReservationTracker:
         """Store a tool reservation, returning a duplicate operation if present."""
         key = (reservation.run_id, reservation.operation_id)
         previous = self._pending_tools.get(key)
+        if previous is None:
+            previous = self._settling_tools.pop(key, None)
         self._pending_tools[key] = reservation
         return previous
 
@@ -73,17 +77,29 @@ class ReservationTracker:
         )
 
     def complete_tool(self, reservation: PendingReservation) -> bool:
-        """Remove a tool reservation after a confirmed commit."""
+        """Remove a tool reservation after commit settlement."""
+        key = (reservation.run_id, reservation.operation_id)
+        for reservations in (self._pending_tools, self._settling_tools):
+            if reservations.get(key) is reservation:
+                del reservations[key]
+                return True
+        return False
+
+    def begin_tool_commit(self, reservation: PendingReservation) -> bool:
+        """Move a tool operation out of active lookup while its commit settles."""
         key = (reservation.run_id, reservation.operation_id)
         if self._pending_tools.get(key) is not reservation:
             return False
         del self._pending_tools[key]
+        self._settling_tools[key] = reservation
         return True
 
     def register_llm(self, reservation: PendingReservation) -> PendingReservation | None:
         """Store an LLM reservation, returning an exact duplicate if present."""
         key = (reservation.run_id, reservation.operation_id)
         previous = self._pending_llms.get(key)
+        if previous is None:
+            previous = self._settling_llms.pop(key, None)
         self._pending_llms[key] = reservation
         return previous
 
@@ -97,11 +113,21 @@ class ReservationTracker:
         )
 
     def complete_llm(self, reservation: PendingReservation) -> bool:
-        """Remove an LLM reservation after a confirmed commit."""
+        """Remove an LLM reservation after commit settlement."""
+        key = (reservation.run_id, reservation.operation_id)
+        for reservations in (self._pending_llms, self._settling_llms):
+            if reservations.get(key) is reservation:
+                del reservations[key]
+                return True
+        return False
+
+    def begin_llm_commit(self, reservation: PendingReservation) -> bool:
+        """Move an LLM operation out of active lookup while its commit settles."""
         key = (reservation.run_id, reservation.operation_id)
         if self._pending_llms.get(key) is not reservation:
             return False
         del self._pending_llms[key]
+        self._settling_llms[key] = reservation
         return True
 
     def pop_run(self, run_id: str) -> list[PendingReservation]:
@@ -110,14 +136,25 @@ class ReservationTracker:
         result = [self._pending_tools.pop(key) for key in tool_keys]
         llm_keys = [key for key in self._pending_llms if key[0] == run_id]
         result.extend(self._pending_llms.pop(key) for key in llm_keys)
+        settling_tool_keys = [key for key in self._settling_tools if key[0] == run_id]
+        result.extend(self._settling_tools.pop(key) for key in settling_tool_keys)
+        settling_llm_keys = [key for key in self._settling_llms if key[0] == run_id]
+        result.extend(self._settling_llms.pop(key) for key in settling_llm_keys)
         self.forget_run(run_id)
         return result
 
     def pop_all(self) -> list[PendingReservation]:
         """Atomically detach all reservations across all runs."""
-        result = [*self._pending_tools.values(), *self._pending_llms.values()]
+        result = [
+            *self._pending_tools.values(),
+            *self._pending_llms.values(),
+            *self._settling_tools.values(),
+            *self._settling_llms.values(),
+        ]
         self._pending_tools.clear()
         self._pending_llms.clear()
+        self._settling_tools.clear()
+        self._settling_llms.clear()
         self._operation_counts.clear()
         return result
 
@@ -131,19 +168,23 @@ class ReservationTracker:
         """Return the number of pending reservations for one run."""
         tool_count = sum(key[0] == run_id for key in self._pending_tools)
         llm_count = sum(key[0] == run_id for key in self._pending_llms)
-        return tool_count + llm_count
+        settling_tool_count = sum(key[0] == run_id for key in self._settling_tools)
+        settling_llm_count = sum(key[0] == run_id for key in self._settling_llms)
+        return tool_count + llm_count + settling_tool_count + settling_llm_count
 
     @property
     def pending_run_ids(self) -> tuple[str, ...]:
         """Return the run IDs that currently own pending reservations."""
         run_ids = {run_id for run_id, _ in self._pending_tools}
         run_ids.update(run_id for run_id, _ in self._pending_llms)
+        run_ids.update(run_id for run_id, _ in self._settling_tools)
+        run_ids.update(run_id for run_id, _ in self._settling_llms)
         return tuple(sorted(run_ids))
 
     @property
     def pending_tool_count(self) -> int:
-        return len(self._pending_tools)
+        return len(self._pending_tools) + len(self._settling_tools)
 
     @property
     def has_pending_llm(self) -> bool:
-        return bool(self._pending_llms)
+        return bool(self._pending_llms or self._settling_llms)

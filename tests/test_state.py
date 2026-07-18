@@ -76,6 +76,29 @@ class TestReservationTracker:
         t.register_tool(p2)
         assert t.complete_tool(p1) is False
 
+    def test_settling_tool_is_hidden_from_active_lookup_but_remains_releasable(self) -> None:
+        t = ReservationTracker()
+        p = _make_pending("search")
+        t.register_tool(p)
+
+        assert t.begin_tool_commit(p) is True
+        assert t.begin_tool_commit(p) is False
+        assert t.get_tool("run_1", operation_id="op_1") is None
+        assert t.pending_count("run_1") == 1
+        assert t.pending_tool_count == 1
+        assert t.pop_run("run_1") == [p]
+
+    def test_duplicate_tool_operation_replaces_settling_reservation(self) -> None:
+        t = ReservationTracker()
+        p1 = _make_pending("search", "res_1")
+        p2 = _make_pending("search", "res_2")
+        t.register_tool(p1)
+        assert t.begin_tool_commit(p1) is True
+
+        assert t.register_tool(p2) is p1
+        assert t.get_tool("run_1", operation_id="op_1") is p2
+        assert t.complete_tool(p1) is False
+
     def test_register_and_pop_llm(self) -> None:
         t = ReservationTracker()
         p = _make_pending("__llm__", "res_llm")
@@ -109,6 +132,30 @@ class TestReservationTracker:
         p2 = _make_pending("__llm__", "res_2")
         assert t.register_llm(p1) is None
         assert t.register_llm(p2) is p1
+
+    def test_settling_llm_is_hidden_from_active_lookup_but_remains_releasable(self) -> None:
+        t = ReservationTracker()
+        p = _make_pending("__llm__", "res_llm")
+        t.register_llm(p)
+
+        assert t.begin_llm_commit(p) is True
+        assert t.begin_llm_commit(p) is False
+        assert t.get_llm("run_1") is None
+        assert t.pending_count("run_1") == 1
+        assert t.has_pending_llm is True
+        assert t.complete_llm(p) is True
+        assert t.pending_count("run_1") == 0
+
+    def test_duplicate_llm_operation_replaces_settling_reservation(self) -> None:
+        t = ReservationTracker()
+        p1 = _make_pending("__llm__", "res_1")
+        p2 = _make_pending("__llm__", "res_2")
+        t.register_llm(p1)
+        assert t.begin_llm_commit(p1) is True
+
+        assert t.register_llm(p2) is p1
+        assert t.get_llm("run_1", operation_id="op_1") is p2
+        assert t.complete_llm(p1) is False
 
     def test_llms_for_concurrent_runs_do_not_overwrite(self) -> None:
         t = ReservationTracker()

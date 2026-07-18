@@ -130,6 +130,8 @@ async for event in result.stream_events():
 
 The OpenAI Agents SDK does not expose a general `RunHooks.on_error` callback. If you call bare `Runner.run(..., hooks=hooks)` or `Runner.run_streamed(..., hooks=hooks)`, automatic exception/cancellation cleanup cannot run. In a single-run error path, call `release_pending()`; when multiple runs are pending it raises instead of guessing and releasing another run. Prefer the wrappers for concurrent runs because they carry a stable run ID into scoped cleanup. `release_all_pending()` is the explicit application-shutdown escape hatch. Heartbeats are capped at 10 minutes by default, so even a missed cleanup path eventually falls back to reservation TTL expiry instead of extending forever.
 
+Commit failures are isolated from later operations. A reservation leaves active start/end correlation before its commit is attempted: ordinary client rejections are released immediately, already-finalized and idempotency-mismatch responses are retired without an unsafe release, and exhausted ambiguous failures remain available only for run cleanup. A later LLM or tool completion therefore cannot accidentally reuse the failed reservation or attach new usage metrics to it.
+
 When budget is denied, the hooks raise `BudgetExceededError`:
 
 ```python
@@ -241,7 +243,7 @@ CyclesRunHooks(
 - **Handoff-aware**: Agent handoffs recorded as audit events in the Cycles ledger
 - **Bounded heartbeat**: TTL extension keeps active reservations alive but stops after a configurable maximum age
 - **Run-finalization cleanup**: `hooks.run()` and `hooks.run_streamed()` release run-scoped reservations on exceptions and cancellation; TTL expiry is the fallback
-- **Replay-safe commits**: Retryable commit failures reuse the same deterministic idempotency key and request
+- **Replay-safe, isolated commits**: Retries reuse one deterministic request, and failed settlements cannot poison later operation correlation
 - **Fail-closed by default**: Cycles transport and HTTP errors block governed operations; `fail_open=True` is explicit opt-in
 - **Environment config**: `CYCLES_BASE_URL` + `CYCLES_API_KEY` for zero-config setup
 - **Typed exceptions**: `BudgetExceededError` for precise error handling

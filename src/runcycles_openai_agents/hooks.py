@@ -332,6 +332,45 @@ class CyclesRunHooks(RunHooks[TContext]):
             )
         raise AssertionError("commit retry loop exhausted unexpectedly")
 
+    @staticmethod
+    def _commit_error_code(response: CyclesResponse) -> str | None:
+        error_response = response.get_error_response()
+        if error_response is None or error_response.error_code is None:
+            return None
+        return str(error_response.error_code.value)
+
+    async def _settle_failed_commit(
+        self,
+        pending: PendingReservation,
+        response: CyclesResponse,
+        *,
+        operation: Literal["tool", "llm"],
+    ) -> None:
+        """Finalize conclusive failures while retaining ambiguous ones for run cleanup."""
+        if not response.is_client_error:
+            return
+
+        error_code = self._commit_error_code(response)
+        if error_code in {"RESERVATION_FINALIZED", "RESERVATION_EXPIRED"}:
+            logger.warning(
+                "cycles: reservation already finalized or expired reservation=%s error=%s",
+                pending.reservation_id,
+                error_code,
+            )
+        elif error_code == "IDEMPOTENCY_MISMATCH":
+            logger.warning(
+                "cycles: commit idempotency mismatch; reservation not released reservation=%s",
+                pending.reservation_id,
+            )
+        else:
+            reason = f"commit_rejected_{error_code or response.status}"
+            await self._release_reservation(pending, reason)
+
+        if operation == "tool":
+            self._tracker.complete_tool(pending)
+        else:
+            self._tracker.complete_llm(pending)
+
     def _start_heartbeat(
         self,
         reservation_id: str,
@@ -540,6 +579,8 @@ class CyclesRunHooks(RunHooks[TContext]):
         if pending is None:
             return
 
+        if not self._tracker.begin_tool_commit(pending):
+            return
         pending.cancel_heartbeat()
         response = await self._commit_reservation(
             pending,
@@ -554,6 +595,7 @@ class CyclesRunHooks(RunHooks[TContext]):
                 tool.name,
                 response.error_message,
             )
+            await self._settle_failed_commit(pending, response, operation="tool")
 
     async def on_llm_start(
         self,
@@ -647,6 +689,8 @@ class CyclesRunHooks(RunHooks[TContext]):
         if pending is None:
             return
 
+        if not self._tracker.begin_llm_commit(pending):
+            return
         pending.cancel_heartbeat()
         tokens_in = getattr(response.usage, "input_tokens", 0) or 0
         tokens_out = getattr(response.usage, "output_tokens", 0) or 0
@@ -668,6 +712,7 @@ class CyclesRunHooks(RunHooks[TContext]):
                 pending.reservation_id,
                 resp.error_message,
             )
+            await self._settle_failed_commit(pending, resp, operation="llm")
 
     async def on_handoff(
         self,

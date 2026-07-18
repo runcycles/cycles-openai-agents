@@ -31,7 +31,12 @@ def _hooks(client: AsyncMock, **kwargs: Any) -> CyclesRunHooks[Any]:
     return CyclesRunHooks(client=client, **defaults)
 
 
-def _final_model_response(text: str = "ok") -> ModelResponse:
+def _final_model_response(
+    text: str = "ok",
+    *,
+    input_tokens: int = 2,
+    output_tokens: int = 1,
+) -> ModelResponse:
     output_text = ResponseOutputText(
         type="output_text",
         text=text,
@@ -47,7 +52,12 @@ def _final_model_response(text: str = "ok") -> ModelResponse:
     )
     return ModelResponse(
         output=[message],
-        usage=Usage(requests=1, input_tokens=2, output_tokens=1, total_tokens=3),
+        usage=Usage(
+            requests=1,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+        ),
         response_id="resp_test",
     )
 
@@ -91,6 +101,32 @@ class _ToolCallModel(Model):
             usage=Usage(requests=1, input_tokens=2, output_tokens=1, total_tokens=3),
             response_id="resp_tool",
         )
+
+    def stream_response(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError
+
+
+class _ToolThenFinalModel(Model):
+    def __init__(self, tool_name: str = "continue_run") -> None:
+        self.tool_name = tool_name
+        self.calls = 0
+
+    async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        self.calls += 1
+        if self.calls == 1:
+            tool_call = ResponseFunctionToolCall(
+                type="function_call",
+                id="fc_continue",
+                call_id="call_continue",
+                name=self.tool_name,
+                arguments="{}",
+            )
+            return ModelResponse(
+                output=[tool_call],
+                usage=Usage(requests=1, input_tokens=11, output_tokens=7, total_tokens=18),
+                response_id="resp_continue",
+            )
+        return _final_model_response("done", input_tokens=23, output_tokens=9)
 
     def stream_response(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
@@ -301,6 +337,34 @@ class TestOnToolEnd:
 
         assert mock_client.commit_reservation.await_count == 2
 
+    async def test_terminal_commit_failure_does_not_poison_legacy_tool_lookup(
+        self,
+        mock_client: AsyncMock,
+        mock_context: MagicMock,
+        mock_agent: MagicMock,
+        mock_tool: MagicMock,
+    ) -> None:
+        mock_client.create_reservation.side_effect = [
+            make_success_response(reservation_id="res_tool_rejected"),
+            make_success_response(reservation_id="res_tool_next"),
+        ]
+        mock_client.commit_reservation.side_effect = [make_http_error(400), make_commit_response()]
+        mock_client.release_reservation.return_value = make_commit_response()
+        h = _hooks(mock_client, ttl_ms=0, tool_estimates={"test-tool": 10})
+
+        await h.on_tool_start(mock_context, mock_agent, mock_tool)
+        await h.on_tool_end(mock_context, mock_agent, mock_tool, "first")
+        await h.on_tool_start(mock_context, mock_agent, mock_tool)
+        await h.on_tool_end(mock_context, mock_agent, mock_tool, "second")
+
+        assert [call.args[0] for call in mock_client.commit_reservation.await_args_list] == [
+            "res_tool_rejected",
+            "res_tool_next",
+        ]
+        mock_client.release_reservation.assert_awaited_once()
+        assert mock_client.release_reservation.call_args.args[0] == "res_tool_rejected"
+        assert h._tracker.pending_tool_count == 0
+
 
 # --- on_llm_start ---
 
@@ -453,6 +517,31 @@ class TestOnLlmEnd:
         await h.on_llm_end(mock_context, mock_agent, mock_response)
 
         assert mock_client.commit_reservation.await_count == 2
+
+    @pytest.mark.parametrize("error_code", ["RESERVATION_EXPIRED", "IDEMPOTENCY_MISMATCH"])
+    async def test_finalized_commit_errors_leave_active_lookup_without_release(
+        self,
+        mock_client: AsyncMock,
+        mock_context: MagicMock,
+        mock_agent: MagicMock,
+        error_code: str,
+    ) -> None:
+        mock_client.create_reservation.return_value = make_success_response(reservation_id="res_finalized")
+        mock_client.commit_reservation.return_value = make_http_error(
+            409,
+            body={"error": error_code, "message": "already settled", "request_id": "req_1"},
+        )
+        h = _hooks(mock_client, ttl_ms=0)
+        response = MagicMock()
+        response.usage.input_tokens = 10
+        response.usage.output_tokens = 5
+
+        await h.on_llm_start(mock_context, mock_agent, None, [])
+        await h.on_llm_end(mock_context, mock_agent, response)
+
+        mock_client.release_reservation.assert_not_awaited()
+        assert h._tracker.get_llm(h._run_id(mock_context)) is None
+        assert h._tracker.has_pending_llm is False
 
 
 # --- on_handoff ---
@@ -889,6 +978,84 @@ class TestRunnerLifecycleSafety:
         assert h._tracker.pending_count("run-a") == 0
         assert h._tracker.pending_count("run-b") == 0
         mock_client.release_reservation.assert_not_awaited()
+
+    async def test_terminal_llm_commit_failure_does_not_poison_next_turn(self, mock_client: AsyncMock) -> None:
+        mock_client.create_reservation.side_effect = [
+            make_success_response(reservation_id="res_llm_rejected"),
+            make_success_response(reservation_id="res_llm_next"),
+        ]
+        mock_client.commit_reservation.side_effect = [make_http_error(400), make_commit_response()]
+        mock_client.release_reservation.return_value = make_commit_response()
+        h = _hooks(mock_client, ttl_ms=0, tool_estimates={"continue_run": 0})
+
+        async def continue_run() -> str:
+            """Continue to the next model turn."""
+            return "continued"
+
+        agent = Agent(
+            name="terminal-commit-recovery",
+            model=_ToolThenFinalModel(),
+            tools=[function_tool(continue_run)],
+        )
+
+        result = await h.run(agent, "start", run_id="run-terminal-commit")
+
+        assert result.final_output == "done"
+        assert [call.args[0] for call in mock_client.commit_reservation.await_args_list] == [
+            "res_llm_rejected",
+            "res_llm_next",
+        ]
+        second_request = mock_client.commit_reservation.await_args_list[1].args[1]
+        assert second_request.metrics.tokens_input == 23
+        assert second_request.metrics.tokens_output == 9
+        mock_client.release_reservation.assert_awaited_once()
+        released_id, release_request = mock_client.release_reservation.call_args.args
+        assert released_id == "res_llm_rejected"
+        assert release_request.reason == "commit_rejected_400"
+        assert h._tracker.pending_count("run-terminal-commit") == 0
+
+    async def test_exhausted_llm_commit_retries_do_not_poison_next_turn(self, mock_client: AsyncMock) -> None:
+        mock_client.create_reservation.side_effect = [
+            make_success_response(reservation_id="res_llm_exhausted"),
+            make_success_response(reservation_id="res_llm_after_exhaustion"),
+        ]
+        mock_client.commit_reservation.side_effect = [
+            make_http_error(503),
+            make_http_error(503),
+            make_commit_response(),
+        ]
+        mock_client.release_reservation.return_value = make_commit_response()
+        h = _hooks(mock_client, ttl_ms=0, tool_estimates={"continue_run": 0})
+
+        async def continue_run() -> str:
+            """Continue to the next model turn."""
+            return "continued"
+
+        agent = Agent(
+            name="exhausted-commit-recovery",
+            model=_ToolThenFinalModel(),
+            tools=[function_tool(continue_run)],
+        )
+
+        result = await h.run(agent, "start", run_id="run-exhausted-commit")
+
+        assert result.final_output == "done"
+        assert [call.args[0] for call in mock_client.commit_reservation.await_args_list] == [
+            "res_llm_exhausted",
+            "res_llm_exhausted",
+            "res_llm_after_exhaustion",
+        ]
+        first_request = mock_client.commit_reservation.await_args_list[0].args[1]
+        retry_request = mock_client.commit_reservation.await_args_list[1].args[1]
+        next_request = mock_client.commit_reservation.await_args_list[2].args[1]
+        assert first_request is retry_request
+        assert next_request.metrics.tokens_input == 23
+        assert next_request.metrics.tokens_output == 9
+        mock_client.release_reservation.assert_awaited_once()
+        released_id, release_request = mock_client.release_reservation.call_args.args
+        assert released_id == "res_llm_exhausted"
+        assert release_request.reason == "agent_run_completed_with_pending_reservations"
+        assert h._tracker.pending_count("run-exhausted-commit") == 0
 
 
 class TestCommitIdempotency:

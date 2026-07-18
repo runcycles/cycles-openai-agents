@@ -42,12 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   heartbeat expiry remains the fallback if callers use bare SDK Runner methods
   without manual cleanup.
 - Derive commit idempotency keys from the stable run ID and SDK operation ID
-  (tool call ID or LLM span/sequence), and retain failed commits for safe replay
-  with the same key.
+  (tool call ID or LLM span/sequence), and reuse the same request for every
+  retry attempt.
 - Scope pending tools, LLM calls, operation counters, and cleanup by run and
   operation ID so one hooks instance can safely serve concurrent runs.
 - Prevent an unscoped manual cleanup from releasing reservations belonging to
   other live runs.
+- Move operations out of active hook correlation before committing. Terminal
+  client errors are settled or released immediately; exhausted ambiguous
+  failures remain cleanup-eligible but cannot capture a later LLM/tool end or
+  its usage metrics.
 
 ## [0.2.1] — 2026-05-07
 

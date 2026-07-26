@@ -10,12 +10,14 @@
 
 ## 2026-07-26 — dependency and workflow maintenance
 
-Dependabot PRs #48–#50 update the PyPI trusted-publishing action to 1.14.1,
-the CodeQL SARIF uploader to 4.37.3, and OSSF Scorecard to 2.4.4. All changes
-are SHA-pinned workflow-only patches; package code, the OpenAI Agents SDK
-contract, the Cycles wire contract, and the published dependency graph are
-unchanged. The repository's build, test, lint, type, coverage, and security
-checks passed on the reviewed heads.
+Dependabot PRs #46–#50 update checkout to 7.0.1, `actions/setup-python` to
+7.0.0, the PyPI trusted-publishing action to 1.14.1, the CodeQL SARIF uploader
+to 4.37.3, and OSSF Scorecard to 2.4.4. The setup major moves its runtime to
+ESM and removes the unused optional `pip-install` input. All changes are
+SHA-pinned and workflow-only; package code, the OpenAI Agents SDK contract, the
+Cycles wire contract, and the published dependency graph are unchanged. The
+repository's build, test, lint, type, coverage, and security checks passed on
+all five heads.
 
 ## Summary
 

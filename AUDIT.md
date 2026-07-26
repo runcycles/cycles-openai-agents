@@ -8,6 +8,15 @@
 
 ---
 
+## 2026-07-26 — dependency and workflow maintenance
+
+Dependabot PRs #48–#50 update the PyPI trusted-publishing action to 1.14.1,
+the CodeQL SARIF uploader to 4.37.3, and OSSF Scorecard to 2.4.4. All changes
+are SHA-pinned workflow-only patches; package code, the OpenAI Agents SDK
+contract, the Cycles wire contract, and the published dependency graph are
+unchanged. The repository's build, test, lint, type, coverage, and security
+checks passed on the reviewed heads.
+
 ## Summary
 
 | Category | Pass | Issues |

@@ -3,10 +3,26 @@
 **Date:** 2026-07-18
 **Package:** `runcycles-openai-agents` v0.2.1 + unreleased lifecycle fixes
 **OpenAI Agents SDK:** v0.13.2
-**Cycles Client:** `runcycles` v0.4.1
+**Cycles Client:** `runcycles` v0.5.0
 **Protocol Spec:** `cycles-protocol-v0.yaml` (v0.1.24)
 
 ---
+
+## 2026-07-27 — runcycles 0.5.0 floor + durable commit-failure settlement
+
+`pyproject.toml` raises the `runcycles` floor from `>=0.2.0` to `>=0.5.0` and
+`CyclesRunHooks` now reconciles its commit path with the SDK's durable retry
+engine. The bounded inline attempts (`commit_max_attempts`) are unchanged; on
+final failure the commit routes to `AsyncCommitRetryEngine` (on-disk journal,
+exponential backoff, replay on restart) instead of being dropped or released
+by run cleanup: transport/5xx/auth/rate-limit/unknown-4xx outcomes are
+journaled (429 passes Retry-After through; 401/403 never release spent
+budget), 410/`RESERVATION_EXPIRED` falls back to `POST /v1/events` with the
+commit's idempotency key and reservation-time subject/action, and only
+recognized protocol rejections keep the immediate-release behavior. New
+optional `retry_engine` constructor parameter; engine is built from the
+client's `CyclesConfig` otherwise. 141 tests, 95.95% coverage, mypy strict and
+ruff clean.
 
 ## 2026-07-26 — dependency and workflow maintenance
 

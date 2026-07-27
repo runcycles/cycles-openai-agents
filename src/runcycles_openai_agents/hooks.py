@@ -25,6 +25,7 @@ from runcycles import (
     CyclesConfig,
     CyclesMetrics,
     CyclesResponse,
+    ErrorCode,
     EventCreateRequest,
     ReleaseRequest,
     ReservationCreateRequest,
@@ -32,6 +33,7 @@ from runcycles import (
     Subject,
     Unit,
 )
+from runcycles.retry import AsyncCommitRetryEngine
 
 from runcycles_openai_agents._defaults import (
     DEFAULT_ACTION_KIND_HANDOFF,
@@ -158,13 +160,18 @@ class CyclesRunHooks(RunHooks[TContext]):
         commit_max_attempts: int = DEFAULT_COMMIT_MAX_ATTEMPTS,
         overage_policy: CommitOveragePolicy | str = CommitOveragePolicy.ALLOW_IF_AVAILABLE,
         dry_run: bool = False,
+        retry_engine: AsyncCommitRetryEngine | None = None,
     ) -> None:
+        engine_config: Any = config
         if client is not None:
             self._client = client
+            if engine_config is None:
+                engine_config = getattr(client, "_config", None)
         elif config is not None:
             self._client = AsyncCyclesClient(config)
         else:
-            self._client = AsyncCyclesClient(CyclesConfig.from_env())
+            engine_config = CyclesConfig.from_env()
+            self._client = AsyncCyclesClient(engine_config)
 
         self._tenant = tenant
         self._workspace = workspace
@@ -195,6 +202,19 @@ class CyclesRunHooks(RunHooks[TContext]):
             overage_policy if isinstance(overage_policy, CommitOveragePolicy) else CommitOveragePolicy(overage_policy)
         )
         self._dry_run = dry_run
+
+        # Background settlement for commits that exhaust the bounded inline
+        # attempts: the SDK's durable retry engine (runcycles>=0.5.0) journals
+        # them on disk, retries with backoff, and falls back to POST /v1/events
+        # when the reservation expires before the commit lands.
+        if retry_engine is not None:
+            self._retry_engine: AsyncCommitRetryEngine | None = retry_engine
+        elif isinstance(engine_config, CyclesConfig):
+            self._retry_engine = AsyncCommitRetryEngine(engine_config)
+        else:
+            self._retry_engine = None
+        if self._retry_engine is not None:
+            self._retry_engine.set_client(self._client)
 
         self._tracker = ReservationTracker()
 
@@ -296,27 +316,26 @@ class CyclesRunHooks(RunHooks[TContext]):
     async def _commit_reservation(
         self,
         pending: PendingReservation,
-        actual: Amount,
-        metrics: CyclesMetrics | None = None,
-    ) -> CyclesResponse:
-        """Commit with one stable request and idempotency key across retries."""
-        request = CommitRequest(
-            idempotency_key=pending.commit_idempotency_key,
-            actual=actual,
-            metrics=metrics,
-        )
+        request: CommitRequest,
+    ) -> CyclesResponse | None:
+        """Commit with one stable request and idempotency key across retries.
+
+        Returns ``None`` when every bounded inline attempt raised; the caller
+        then routes the commit to the background retry engine instead of
+        letting the exception abort the run (and release spent budget).
+        """
         for attempt in range(1, self._commit_max_attempts + 1):
             try:
                 response = await self._client.commit_reservation(pending.reservation_id, request)
             except Exception:
-                if attempt >= self._commit_max_attempts:
-                    raise
                 logger.warning(
-                    "cycles: commit raised; retrying reservation=%s attempt=%s",
+                    "cycles: commit raised reservation=%s attempt=%s",
                     pending.reservation_id,
                     attempt,
                     exc_info=True,
                 )
+                if attempt >= self._commit_max_attempts:
+                    return None
                 continue
             if (
                 response.is_success
@@ -335,41 +354,144 @@ class CyclesRunHooks(RunHooks[TContext]):
     @staticmethod
     def _commit_error_code(response: CyclesResponse) -> str | None:
         error_response = response.get_error_response()
-        if error_response is None or error_response.error_code is None:
-            return None
-        return str(error_response.error_code.value)
+        if error_response is not None and error_response.error_code is not None:
+            return str(error_response.error_code.value)
+        # Mirror runcycles.retry._extract_error_code: fall back to the raw
+        # body field so partial error bodies still classify correctly.
+        raw = response.get_body_attribute("error")
+        return raw if isinstance(raw, str) else None
+
+    @staticmethod
+    def _recognized_rejection(error_code: str | None) -> bool:
+        """True when the error code is a known protocol code (not forward-compat).
+
+        Mirrors ``runcycles.retry``: only a recognized rejection justifies
+        releasing a reservation whose guarded work already ran; a codeless or
+        unknown-future-code 4xx is journaled instead.
+        """
+        return error_code is not None and ErrorCode.from_string(error_code) is not ErrorCode.UNKNOWN
+
+    def _build_event_fallback_body(
+        self,
+        pending: PendingReservation,
+        request: CommitRequest,
+    ) -> dict[str, Any]:
+        """Build a POST /v1/events body recording spend whose reservation expired.
+
+        Mirrors ``runcycles.lifecycle._build_event_fallback_body``: reuses the
+        commit's idempotency key (the event idempotency namespace is separate,
+        so replays across process restarts stay exactly-once) and omits
+        ``overage_policy`` — the spec default ALLOW_IF_AVAILABLE never rejects,
+        the right bias when the spend has already happened.
+        """
+        commit_body = request.model_dump(mode="json", exclude_none=True)
+        subject = pending.subject if pending.subject is not None else self._subject(agent_name=pending.agent_name)
+        action = pending.action if pending.action is not None else Action(kind="unknown", name=pending.tool_name)
+        body: dict[str, Any] = {
+            "idempotency_key": commit_body["idempotency_key"],
+            "subject": subject.model_dump(mode="json", exclude_none=True),
+            "action": action.model_dump(mode="json", exclude_none=True),
+            "actual": commit_body["actual"],
+            "metadata": {
+                "recovered_reservation_id": pending.reservation_id,
+                "recovery_reason": "commit_after_reservation_expired",
+            },
+        }
+        if "metrics" in commit_body:
+            body["metrics"] = commit_body["metrics"]
+        return body
+
+    def _schedule_commit_recovery(
+        self,
+        pending: PendingReservation,
+        request: CommitRequest,
+        *,
+        retry_after_ms: int | None = None,
+        expired: bool = False,
+    ) -> None:
+        """Hand an exhausted commit to the SDK's durable retry engine."""
+        if self._retry_engine is None:
+            logger.error(
+                "cycles: no retry engine available; failed commit dropped reservation=%s",
+                pending.reservation_id,
+            )
+            return
+        event_body = self._build_event_fallback_body(pending, request)
+        if expired:
+            self._retry_engine.schedule_event(pending.reservation_id, event_body)
+            return
+        self._retry_engine.schedule(
+            pending.reservation_id,
+            request.model_dump(mode="json", exclude_none=True),
+            event_body,
+            retry_after_ms=retry_after_ms,
+        )
 
     async def _settle_failed_commit(
         self,
         pending: PendingReservation,
-        response: CyclesResponse,
+        request: CommitRequest,
+        response: CyclesResponse | None,
         *,
         operation: Literal["tool", "llm"],
     ) -> None:
-        """Finalize conclusive failures while retaining ambiguous ones for run cleanup."""
-        if not response.is_client_error:
-            return
+        """Route an exhausted commit failure; never release spent budget.
 
-        error_code = self._commit_error_code(response)
-        if error_code in {"RESERVATION_FINALIZED", "RESERVATION_EXPIRED"}:
-            logger.warning(
-                "cycles: reservation already finalized or expired reservation=%s error=%s",
-                pending.reservation_id,
-                error_code,
-            )
-        elif error_code == "IDEMPOTENCY_MISMATCH":
-            logger.warning(
-                "cycles: commit idempotency mismatch; reservation not released reservation=%s",
-                pending.reservation_id,
-            )
-        else:
-            reason = f"commit_rejected_{error_code or response.status}"
-            await self._release_reservation(pending, reason)
-
-        if operation == "tool":
-            self._tracker.complete_tool(pending)
-        else:
-            self._tracker.complete_llm(pending)
+        Classification mirrors ``runcycles.lifecycle._handle_commit`` (SDK
+        0.5.0): ambiguous/transient outcomes and auth failures are journaled
+        for background retry, an expired reservation falls back to
+        POST /v1/events, and only recognized protocol rejections keep the
+        pre-0.5.0 release behavior. The operation is always retired from the
+        tracker so run cleanup cannot release a journaled commit's budget.
+        """
+        try:
+            if response is None or response.is_transport_error or response.is_server_error:
+                # Raised on every inline attempt, transport failure, or 5xx:
+                # the spend happened — journal and retry in the background.
+                self._schedule_commit_recovery(pending, request)
+                return
+            error_code = self._commit_error_code(response)
+            if response.status == 429 or error_code == "LIMIT_EXCEEDED":
+                # Rate-limited, not rejected: retry honoring Retry-After.
+                self._schedule_commit_recovery(pending, request, retry_after_ms=response.retry_after_ms_header)
+            elif response.status in (401, 403):
+                # Credentials failed after the spend happened: journal for
+                # replay once fixed. Never release — that would return budget
+                # for real spend.
+                self._schedule_commit_recovery(pending, request)
+            elif response.status == 410 or error_code == "RESERVATION_EXPIRED":
+                logger.warning(
+                    "cycles: reservation expired before commit; recovering spend via POST /v1/events reservation=%s",
+                    pending.reservation_id,
+                )
+                self._schedule_commit_recovery(pending, request, expired=True)
+            elif error_code == "RESERVATION_FINALIZED":
+                logger.warning(
+                    "cycles: reservation already finalized reservation=%s",
+                    pending.reservation_id,
+                )
+            elif error_code == "IDEMPOTENCY_MISMATCH":
+                logger.warning(
+                    "cycles: commit idempotency mismatch; reservation not released reservation=%s",
+                    pending.reservation_id,
+                )
+            elif response.is_client_error and self._recognized_rejection(error_code):
+                await self._release_reservation(pending, f"commit_rejected_{error_code}")
+            elif response.is_client_error:
+                # Codeless or forward-compat-unknown 4xx: neither release nor
+                # drop — retain the spend record for background settlement.
+                self._schedule_commit_recovery(pending, request)
+            else:
+                logger.warning(
+                    "cycles: unrecognized commit response reservation=%s status=%s",
+                    pending.reservation_id,
+                    response.status,
+                )
+        finally:
+            if operation == "tool":
+                self._tracker.complete_tool(pending)
+            else:
+                self._tracker.complete_llm(pending)
 
     def _start_heartbeat(
         self,
@@ -486,10 +608,12 @@ class CyclesRunHooks(RunHooks[TContext]):
             f"tool:{call_id}" if call_id is not None else self._tracker.next_operation_id(run_id, f"tool:{tool.name}")
         )
         est_cfg = self._tool_estimate_map.get(tool.name)
+        subject = self._subject(agent_name=agent.name, toolset_name=tool.name)
+        action = Action(kind=est_cfg.action_kind, name=tool.name)
         request = ReservationCreateRequest(
             idempotency_key=self._idempotency_key(run_id, "reserve", operation_id),
-            subject=self._subject(agent_name=agent.name, toolset_name=tool.name),
-            action=Action(kind=est_cfg.action_kind, name=tool.name),
+            subject=subject,
+            action=action,
             estimate=Amount(unit=est_cfg.unit, amount=est_cfg.estimate),
             ttl_ms=self._ttl_ms,
             overage_policy=self._overage_policy,
@@ -550,6 +674,8 @@ class CyclesRunHooks(RunHooks[TContext]):
                 run_id=run_id,
                 operation_id=operation_id,
             ),
+            subject=subject,
+            action=action,
         )
         previous = self._tracker.register_tool(pending)
         if previous is not None:
@@ -582,20 +708,21 @@ class CyclesRunHooks(RunHooks[TContext]):
         if not self._tracker.begin_tool_commit(pending):
             return
         pending.cancel_heartbeat()
-        response = await self._commit_reservation(
-            pending,
-            Amount(unit=pending.unit, amount=pending.estimate),
+        request = CommitRequest(
+            idempotency_key=pending.commit_idempotency_key,
+            actual=Amount(unit=pending.unit, amount=pending.estimate),
         )
-        if response.is_success:
+        response = await self._commit_reservation(pending, request)
+        if response is not None and response.is_success:
             self._tracker.complete_tool(pending)
         else:
             logger.error(
                 "cycles: commit failed reservation=%s tool=%s err=%s",
                 pending.reservation_id,
                 tool.name,
-                response.error_message,
+                response.error_message if response is not None else "commit raised on every attempt",
             )
-            await self._settle_failed_commit(pending, response, operation="tool")
+            await self._settle_failed_commit(pending, request, response, operation="tool")
 
     async def on_llm_start(
         self,
@@ -608,10 +735,12 @@ class CyclesRunHooks(RunHooks[TContext]):
         sequence_id = self._tracker.next_operation_id(run_id, "llm")
         span_id = self._span_id() or agent.name
         operation_id = f"llm:{span_id}:{sequence_id}"
+        subject = self._subject(agent_name=agent.name)
+        action = Action(kind=DEFAULT_ACTION_KIND_LLM, name=agent.name)
         request = ReservationCreateRequest(
             idempotency_key=self._idempotency_key(run_id, "reserve", operation_id),
-            subject=self._subject(agent_name=agent.name),
-            action=Action(kind=DEFAULT_ACTION_KIND_LLM, name=agent.name),
+            subject=subject,
+            action=action,
             estimate=Amount(unit=self._llm_unit, amount=self._llm_estimate),
             ttl_ms=self._ttl_ms,
             overage_policy=self._overage_policy,
@@ -668,6 +797,8 @@ class CyclesRunHooks(RunHooks[TContext]):
                 run_id=run_id,
                 operation_id=operation_id,
             ),
+            subject=subject,
+            action=action,
         )
         duplicate = self._tracker.register_llm(pending)
         if duplicate is not None:
@@ -699,20 +830,21 @@ class CyclesRunHooks(RunHooks[TContext]):
         if pending.unit == Unit.TOKENS:
             actual_amount = tokens_in + tokens_out
 
-        resp = await self._commit_reservation(
-            pending,
-            Amount(unit=pending.unit, amount=actual_amount),
-            CyclesMetrics(tokens_input=tokens_in, tokens_output=tokens_out),
+        request = CommitRequest(
+            idempotency_key=pending.commit_idempotency_key,
+            actual=Amount(unit=pending.unit, amount=actual_amount),
+            metrics=CyclesMetrics(tokens_input=tokens_in, tokens_output=tokens_out),
         )
-        if resp.is_success:
+        resp = await self._commit_reservation(pending, request)
+        if resp is not None and resp.is_success:
             self._tracker.complete_llm(pending)
         else:
             logger.error(
                 "cycles: LLM commit failed reservation=%s err=%s",
                 pending.reservation_id,
-                resp.error_message,
+                resp.error_message if resp is not None else "commit raised on every attempt",
             )
-            await self._settle_failed_commit(pending, resp, operation="llm")
+            await self._settle_failed_commit(pending, request, resp, operation="llm")
 
     async def on_handoff(
         self,

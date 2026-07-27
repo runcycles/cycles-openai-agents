@@ -17,6 +17,12 @@ def mock_client() -> AsyncMock:
 
 
 @pytest.fixture()
+def mock_retry_engine() -> MagicMock:
+    """Return a mock of the SDK's ``AsyncCommitRetryEngine``."""
+    return MagicMock()
+
+
+@pytest.fixture()
 def mock_context() -> MagicMock:
     """Return a mock ``RunContextWrapper``."""
     ctx = MagicMock()

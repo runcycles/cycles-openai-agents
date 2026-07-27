@@ -20,6 +20,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Durable commit-failure settlement via the runcycles 0.5.0 retry engine.**
+  When a reservation commit exhausts its bounded inline attempts
+  (`commit_max_attempts`), `CyclesRunHooks` now hands it to the SDK's
+  `AsyncCommitRetryEngine` — on-disk journal with replay across restarts,
+  exponential backoff, and a `POST /v1/events` fallback when the reservation
+  expires before the commit lands (the event reuses the commit's idempotency
+  key and reservation-time subject/action, and records
+  `recovered_reservation_id` / `recovery_reason="commit_after_reservation_expired"`).
+  Classification mirrors `runcycles.lifecycle`: 429/`LIMIT_EXCEEDED` retries
+  with Retry-After passthrough, 401/403 journals and never releases spent
+  budget, codeless or unknown 4xx journals, and recognized protocol
+  rejections keep the existing immediate-release behavior. New optional
+  `retry_engine` constructor parameter (defaults to an engine built from the
+  client's `CyclesConfig`).
+
 - Repository `CODEOWNERS` for required-review routing.
 - Least-privilege `permissions:` blocks on CI workflows.
 - `CyclesRunHooks.run(...)`, an awaited SDK run-finalization wrapper that
@@ -33,6 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A production commit retry seam (`commit_max_attempts`, default 2) for
   exceptions, transport failures, HTTP 429, and HTTP 5xx responses. Every
   attempt reuses the same request and deterministic idempotency key.
+
+### Changed
+
+- **`runcycles` dependency floor raised from `>=0.2.0` to `>=0.5.0`** for the
+  durable commit retry engine.
+- **Exhausted or ambiguous commit failures are no longer released.**
+  Previously an exhausted transient commit failure was left for run-end
+  cleanup (which released the reservation — returning budget for spend that
+  already happened) and a codeless 4xx rejection was released immediately.
+  Both are now journaled for background settlement, and the operation is
+  retired from the tracker so run cleanup cannot release it.
 
 ### Fixed
 

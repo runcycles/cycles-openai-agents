@@ -6,7 +6,7 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 
-from runcycles.models import Unit
+from runcycles.models import Action, Subject, Unit
 
 
 @dataclass
@@ -23,6 +23,10 @@ class PendingReservation:
     commit_idempotency_key: str
     started_at: float = field(default_factory=time.monotonic)
     heartbeat_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    # Reservation-time subject/action, retained so an expired commit can be
+    # recovered through the SDK retry engine's POST /v1/events fallback.
+    subject: Subject | None = field(default=None, repr=False)
+    action: Action | None = field(default=None, repr=False)
 
     def cancel_heartbeat(self) -> None:
         """Cancel the heartbeat task if running."""

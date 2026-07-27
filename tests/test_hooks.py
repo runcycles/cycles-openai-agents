@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from agents import Agent, Model, ModelResponse, Usage, function_tool
 from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText
-from runcycles import BudgetExceededError, Unit
+from runcycles import BudgetExceededError, CyclesConfig, CyclesResponse, Unit
 
 from runcycles_openai_agents.hooks import CyclesRunHooks
 from runcycles_openai_agents.tool_estimate_map import ToolEstimateMap
@@ -348,7 +348,12 @@ class TestOnToolEnd:
             make_success_response(reservation_id="res_tool_rejected"),
             make_success_response(reservation_id="res_tool_next"),
         ]
-        mock_client.commit_reservation.side_effect = [make_http_error(400), make_commit_response()]
+        # UNIT_MISMATCH is a recognized protocol rejection, so the reservation
+        # is released immediately (codeless 4xx would be journaled instead).
+        mock_client.commit_reservation.side_effect = [
+            make_http_error(400, body={"error": "UNIT_MISMATCH", "message": "unit mismatch"}),
+            make_commit_response(),
+        ]
         mock_client.release_reservation.return_value = make_commit_response()
         h = _hooks(mock_client, ttl_ms=0, tool_estimates={"test-tool": 10})
 
@@ -984,7 +989,12 @@ class TestRunnerLifecycleSafety:
             make_success_response(reservation_id="res_llm_rejected"),
             make_success_response(reservation_id="res_llm_next"),
         ]
-        mock_client.commit_reservation.side_effect = [make_http_error(400), make_commit_response()]
+        # Recognized rejection: released immediately. A codeless 400 would be
+        # journaled by the retry engine instead of released.
+        mock_client.commit_reservation.side_effect = [
+            make_http_error(400, body={"error": "UNIT_MISMATCH", "message": "unit mismatch"}),
+            make_commit_response(),
+        ]
         mock_client.release_reservation.return_value = make_commit_response()
         h = _hooks(mock_client, ttl_ms=0, tool_estimates={"continue_run": 0})
 
@@ -1011,10 +1021,12 @@ class TestRunnerLifecycleSafety:
         mock_client.release_reservation.assert_awaited_once()
         released_id, release_request = mock_client.release_reservation.call_args.args
         assert released_id == "res_llm_rejected"
-        assert release_request.reason == "commit_rejected_400"
+        assert release_request.reason == "commit_rejected_UNIT_MISMATCH"
         assert h._tracker.pending_count("run-terminal-commit") == 0
 
-    async def test_exhausted_llm_commit_retries_do_not_poison_next_turn(self, mock_client: AsyncMock) -> None:
+    async def test_exhausted_llm_commit_retries_do_not_poison_next_turn(
+        self, mock_client: AsyncMock, mock_retry_engine: MagicMock
+    ) -> None:
         mock_client.create_reservation.side_effect = [
             make_success_response(reservation_id="res_llm_exhausted"),
             make_success_response(reservation_id="res_llm_after_exhaustion"),
@@ -1025,7 +1037,7 @@ class TestRunnerLifecycleSafety:
             make_commit_response(),
         ]
         mock_client.release_reservation.return_value = make_commit_response()
-        h = _hooks(mock_client, ttl_ms=0, tool_estimates={"continue_run": 0})
+        h = _hooks(mock_client, ttl_ms=0, tool_estimates={"continue_run": 0}, retry_engine=mock_retry_engine)
 
         async def continue_run() -> str:
             """Continue to the next model turn."""
@@ -1051,10 +1063,14 @@ class TestRunnerLifecycleSafety:
         assert first_request is retry_request
         assert next_request.metrics.tokens_input == 23
         assert next_request.metrics.tokens_output == 9
-        mock_client.release_reservation.assert_awaited_once()
-        released_id, release_request = mock_client.release_reservation.call_args.args
-        assert released_id == "res_llm_exhausted"
-        assert release_request.reason == "agent_run_completed_with_pending_reservations"
+        # Exhausted 5xx commits are journaled with the SDK retry engine, never
+        # released — releasing would return budget for spend that happened.
+        mock_client.release_reservation.assert_not_awaited()
+        mock_retry_engine.schedule.assert_called_once()
+        scheduled_id, commit_body, event_body = mock_retry_engine.schedule.call_args.args
+        assert scheduled_id == "res_llm_exhausted"
+        assert commit_body["idempotency_key"] == first_request.idempotency_key
+        assert event_body["metadata"]["recovered_reservation_id"] == "res_llm_exhausted"
         assert h._tracker.pending_count("run-exhausted-commit") == 0
 
 
@@ -1116,6 +1132,292 @@ class TestCommitIdempotency:
         first_request = mock_client.commit_reservation.await_args_list[0].args[1]
         second_request = mock_client.commit_reservation.await_args_list[1].args[1]
         assert first_request is second_request
+
+
+# --- commit recovery routing (SDK AsyncCommitRetryEngine, runcycles>=0.5.0) ---
+
+
+class TestCommitRecoveryRouting:
+    """Exhausted commit failures route to the SDK's durable retry engine.
+
+    Classification mirrors ``runcycles.lifecycle._handle_commit``: transient,
+    rate-limited, auth, and unknown-4xx outcomes are journaled (never
+    releasing spent budget); expired reservations fall back to
+    ``POST /v1/events``; recognized protocol rejections keep the release path.
+    """
+
+    async def _fail_tool_commit(
+        self,
+        mock_client: AsyncMock,
+        mock_context: MagicMock,
+        mock_agent: MagicMock,
+        mock_tool: MagicMock,
+        mock_retry_engine: MagicMock,
+        commit_outcomes: list[Any],
+        **kwargs: Any,
+    ) -> CyclesRunHooks[Any]:
+        mock_client.create_reservation.return_value = make_success_response(reservation_id="res_route")
+        mock_client.commit_reservation.side_effect = commit_outcomes
+        kwargs.setdefault("commit_max_attempts", 1)
+        h = _hooks(
+            mock_client,
+            ttl_ms=0,
+            tool_estimates={"test-tool": 10},
+            retry_engine=mock_retry_engine,
+            **kwargs,
+        )
+        await h.on_tool_start(mock_context, mock_agent, mock_tool)
+        await h.on_tool_end(mock_context, mock_agent, mock_tool, "result")
+        return h
+
+    async def test_transport_error_schedules_background_retry(
+        self,
+        mock_client: AsyncMock,
+        mock_context: MagicMock,
+        mock_agent: MagicMock,
+        mock_tool: MagicMock,
+        mock_retry_engine: MagicMock,
+    ) -> None:
+        h = await self._fail_tool_commit(
+            mock_client, mock_context, mock_agent, mock_tool, mock_retry_engine, [make_transport_error()]
+        )
+
+        mock_retry_engine.schedule.assert_called_once()
+        reservation_id, commit_body, event_body = mock_retry_engine.schedule.call_args.args
+        commit_request = mock_client.commit_reservation.call_args.args[1]
+        assert reservation_id == "res_route"
+        assert commit_body == commit_request.model_dump(exclude_none=True)
+        assert event_body["idempotency_key"] == commit_request.idempotency_key
+        mock_client.release_reservation.assert_not_awaited()
+        assert h._tracker.pending_tool_count == 0
+
+    async def test_commit_raising_every_attempt_schedules_background_retry(
+        self,
+        mock_client: AsyncMock,
+        mock_context: MagicMock,
+        mock_agent: MagicMock,
+        mock_tool: MagicMock,
+        mock_retry_engine: MagicMock,
+    ) -> None:
+        h = await self._fail_tool_commit(
+            mock_client,
+            mock_context,
+            mock_agent,
+            mock_tool,
+            mock_retry_engine,
+            [ConnectionError("boom"), ConnectionError("boom")],
+            commit_max_attempts=2,
+        )
+
+        assert mock_client.commit_reservation.await_count == 2
+        mock_retry_engine.schedule.assert_called_once()
+        assert mock_retry_engine.schedule.call_args.args[0] == "res_route"
+        mock_client.release_reservation.assert_not_awaited()
+        assert h._tracker.pending_tool_count == 0
+
+    async def test_rate_limited_commit_passes_retry_after_through(
+        self,
+        mock_client: AsyncMock,
+        mock_context: MagicMock,
+        mock_agent: MagicMock,
+        mock_tool: MagicMock,
+        mock_retry_engine: MagicMock,
+    ) -> None:
+        rate_limited = CyclesResponse.http_error(
+            429,
+            "rate limited",
+            body={"error": "LIMIT_EXCEEDED", "message": "slow down"},
+            headers={"retry-after": "7"},
+        )
+        await self._fail_tool_commit(
+            mock_client, mock_context, mock_agent, mock_tool, mock_retry_engine, [rate_limited]
+        )
+
+        mock_retry_engine.schedule.assert_called_once()
+        assert mock_retry_engine.schedule.call_args.kwargs["retry_after_ms"] == 7000
+        mock_client.release_reservation.assert_not_awaited()
+
+    @pytest.mark.parametrize("status", [401, 403])
+    async def test_auth_failure_journals_and_never_releases(
+        self,
+        mock_client: AsyncMock,
+        mock_context: MagicMock,
+        mock_agent: MagicMock,
+        mock_tool: MagicMock,
+        mock_retry_engine: MagicMock,
+        status: int,
+    ) -> None:
+        await self._fail_tool_commit(
+            mock_client, mock_context, mock_agent, mock_tool, mock_retry_engine, [make_http_error(status)]
+        )
+
+        mock_retry_engine.schedule.assert_called_once()
+        mock_retry_engine.schedule_event.assert_not_called()
+        mock_client.release_reservation.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            make_http_error(410, "gone"),
+            make_http_error(409, body={"error": "RESERVATION_EXPIRED", "message": "expired"}),
+        ],
+        ids=["status-410", "code-RESERVATION_EXPIRED"],
+    )
+    async def test_expired_reservation_falls_back_to_event(
+        self,
+        mock_client: AsyncMock,
+        mock_context: MagicMock,
+        mock_agent: MagicMock,
+        mock_tool: MagicMock,
+        mock_retry_engine: MagicMock,
+        response: CyclesResponse,
+    ) -> None:
+        await self._fail_tool_commit(
+            mock_client, mock_context, mock_agent, mock_tool, mock_retry_engine, [response]
+        )
+
+        mock_retry_engine.schedule.assert_not_called()
+        mock_retry_engine.schedule_event.assert_called_once()
+        reservation_id, event_body = mock_retry_engine.schedule_event.call_args.args
+        commit_request = mock_client.commit_reservation.call_args.args[1]
+        assert reservation_id == "res_route"
+        # Event fallback per SDK template: commit idempotency key reused,
+        # reservation-time subject/action, recovery metadata, no overage_policy.
+        assert event_body["idempotency_key"] == commit_request.idempotency_key
+        assert event_body["subject"] == {"tenant": "test-tenant", "agent": "test-agent", "toolset": "test-tool"}
+        assert event_body["action"] == {"kind": "tool.invoke", "name": "test-tool"}
+        assert event_body["actual"] == {"unit": "RISK_POINTS", "amount": 10}
+        assert event_body["metadata"] == {
+            "recovered_reservation_id": "res_route",
+            "recovery_reason": "commit_after_reservation_expired",
+        }
+        assert "overage_policy" not in event_body
+        mock_client.release_reservation.assert_not_awaited()
+
+    async def test_expired_llm_commit_event_carries_metrics(
+        self,
+        mock_client: AsyncMock,
+        mock_context: MagicMock,
+        mock_agent: MagicMock,
+        mock_retry_engine: MagicMock,
+    ) -> None:
+        mock_client.create_reservation.return_value = make_success_response(reservation_id="res_llm_expired")
+        mock_client.commit_reservation.return_value = make_http_error(410, "gone")
+        h = _hooks(mock_client, ttl_ms=0, retry_engine=mock_retry_engine, commit_max_attempts=1)
+        llm_response = MagicMock()
+        llm_response.usage.input_tokens = 100
+        llm_response.usage.output_tokens = 50
+
+        await h.on_llm_start(mock_context, mock_agent, None, [])
+        await h.on_llm_end(mock_context, mock_agent, llm_response)
+
+        mock_retry_engine.schedule_event.assert_called_once()
+        _, event_body = mock_retry_engine.schedule_event.call_args.args
+        assert event_body["metrics"] == {"tokens_input": 100, "tokens_output": 50}
+        assert event_body["action"] == {"kind": "llm.completion", "name": "test-agent"}
+        assert h._tracker.has_pending_llm is False
+
+    async def test_codeless_client_error_journals_instead_of_releasing(
+        self,
+        mock_client: AsyncMock,
+        mock_context: MagicMock,
+        mock_agent: MagicMock,
+        mock_tool: MagicMock,
+        mock_retry_engine: MagicMock,
+    ) -> None:
+        h = await self._fail_tool_commit(
+            mock_client, mock_context, mock_agent, mock_tool, mock_retry_engine, [make_http_error(400)]
+        )
+
+        mock_retry_engine.schedule.assert_called_once()
+        mock_client.release_reservation.assert_not_awaited()
+        assert h._tracker.pending_tool_count == 0
+
+    async def test_recognized_rejection_still_releases(
+        self,
+        mock_client: AsyncMock,
+        mock_context: MagicMock,
+        mock_agent: MagicMock,
+        mock_tool: MagicMock,
+        mock_retry_engine: MagicMock,
+    ) -> None:
+        mock_client.release_reservation.return_value = make_commit_response()
+        await self._fail_tool_commit(
+            mock_client,
+            mock_context,
+            mock_agent,
+            mock_tool,
+            mock_retry_engine,
+            [make_http_error(400, body={"error": "UNIT_MISMATCH", "message": "unit mismatch"})],
+        )
+
+        mock_retry_engine.schedule.assert_not_called()
+        mock_retry_engine.schedule_event.assert_not_called()
+        mock_client.release_reservation.assert_awaited_once()
+        assert mock_client.release_reservation.call_args.args[1].reason == "commit_rejected_UNIT_MISMATCH"
+
+    @pytest.mark.parametrize("error_code", ["RESERVATION_FINALIZED", "IDEMPOTENCY_MISMATCH"])
+    async def test_terminal_codes_neither_journal_nor_release(
+        self,
+        mock_client: AsyncMock,
+        mock_context: MagicMock,
+        mock_agent: MagicMock,
+        mock_tool: MagicMock,
+        mock_retry_engine: MagicMock,
+        error_code: str,
+    ) -> None:
+        h = await self._fail_tool_commit(
+            mock_client,
+            mock_context,
+            mock_agent,
+            mock_tool,
+            mock_retry_engine,
+            [make_http_error(409, body={"error": error_code, "message": "terminal"})],
+        )
+
+        mock_retry_engine.schedule.assert_not_called()
+        mock_retry_engine.schedule_event.assert_not_called()
+        mock_client.release_reservation.assert_not_awaited()
+        assert h._tracker.pending_tool_count == 0
+
+    async def test_missing_engine_drops_without_raising(
+        self,
+        mock_client: AsyncMock,
+        mock_context: MagicMock,
+        mock_agent: MagicMock,
+        mock_tool: MagicMock,
+    ) -> None:
+        mock_client.create_reservation.return_value = make_success_response(reservation_id="res_no_engine")
+        mock_client.commit_reservation.return_value = make_transport_error()
+        h = _hooks(mock_client, ttl_ms=0, tool_estimates={"test-tool": 10}, commit_max_attempts=1)
+        assert h._retry_engine is None  # spec'd mock client exposes no _config
+
+        await h.on_tool_start(mock_context, mock_agent, mock_tool)
+        await h.on_tool_end(mock_context, mock_agent, mock_tool, "result")
+
+        mock_client.release_reservation.assert_not_awaited()
+        assert h._tracker.pending_tool_count == 0
+
+
+class TestRetryEngineConstruction:
+    def test_injected_engine_is_used_and_bound_to_client(
+        self, mock_client: AsyncMock, mock_retry_engine: MagicMock
+    ) -> None:
+        h = _hooks(mock_client, retry_engine=mock_retry_engine)
+
+        assert h._retry_engine is mock_retry_engine
+        mock_retry_engine.set_client.assert_called_once_with(mock_client)
+
+    def test_config_builds_engine(self) -> None:
+        cfg = CyclesConfig(
+            base_url="http://localhost:7878",
+            api_key="cyc_test_key",
+            retry_enabled=False,
+            journal_enabled=False,
+        )
+        h = CyclesRunHooks(config=cfg, tenant="t")
+
+        assert h._retry_engine is not None
 
 
 # --- release_pending ---

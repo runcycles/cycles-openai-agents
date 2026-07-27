@@ -228,9 +228,10 @@ CyclesRunHooks(
     ttl_ms=60_000,              # reservation TTL (heartbeat extends at half-interval)
     heartbeat_max_age_ms=600_000, # stop extending after 10 minutes
     heartbeat_max_extensions=None, # optional additional extension-count cap
-    commit_max_attempts=2,      # retry transport, 429, and 5xx commit failures
+    commit_max_attempts=2,      # inline retries for transport, 429, and 5xx commit failures
     overage_policy=CommitOveragePolicy.ALLOW_IF_AVAILABLE,
     dry_run=False,              # shadow mode — no budget consumed
+    retry_engine=None,          # optional AsyncCommitRetryEngine override (built from client config by default)
 )
 ```
 
@@ -244,6 +245,7 @@ CyclesRunHooks(
 - **Bounded heartbeat**: TTL extension keeps active reservations alive but stops after a configurable maximum age
 - **Run-finalization cleanup**: `hooks.run()` and `hooks.run_streamed()` release run-scoped reservations on exceptions and cancellation; TTL expiry is the fallback
 - **Replay-safe, isolated commits**: Retries reuse one deterministic request, and failed settlements cannot poison later operation correlation
+- **Durable settlement**: Commits that exhaust inline retries are journaled by the runcycles 0.5.0 retry engine (exponential backoff, replay across restarts, `POST /v1/events` fallback for expired reservations) — spent budget is never released
 - **Fail-closed by default**: Cycles transport and HTTP errors block governed operations; `fail_open=True` is explicit opt-in
 - **Environment config**: `CYCLES_BASE_URL` + `CYCLES_API_KEY` for zero-config setup
 - **Typed exceptions**: `BudgetExceededError` for precise error handling

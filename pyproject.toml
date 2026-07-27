@@ -59,7 +59,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "runcycles>=0.2.0",
+    "runcycles>=0.5.0",
     "openai-agents>=0.1.0,<1.0.0",
 ]
 

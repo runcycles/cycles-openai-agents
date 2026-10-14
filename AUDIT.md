@@ -1,5 +1,9 @@
 # Cycles OpenAI Agents SDK Integration — Audit
 
+## 2026-10-14 — Dependency maintenance
+
+Dependabot PR #64 updates the SHA-pinned upload-artifact action to 7.0.2 in publishing and Scorecard workflows. Python dependencies, integration source, and protocol behavior are unchanged. Python 3.10/3.12 lint, typing, tests, and existing coverage gates must pass before merge.
+
 **Date:** 2026-07-18
 **Package:** `runcycles-openai-agents` v0.2.1 + unreleased lifecycle fixes
 **OpenAI Agents SDK:** v0.13.2

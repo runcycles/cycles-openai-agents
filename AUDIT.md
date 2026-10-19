@@ -1,5 +1,15 @@
 # Cycles OpenAI Agents SDK Integration — Audit
 
+## 2026-10-19 — Dependabot dependency review
+
+Consolidates the following reviewed updates on current main:
+
+- PR #65: build(deps): bump github/codeql-action/upload-sarif from 4.38.3 to 4.39.0
+- PR #66: build(deps): bump ossf/scorecard-action from 2.4.4 to 2.5.0
+
+Workflow actions remain pinned to verified upstream commit SHAs. Existing supported runtime versions, application code, and YAML protocol contracts are preserved. Existing lint, build, test, coverage, conformance, and applicable security checks must pass on the combined commit before merge; coverage requirements are not lowered.
+
+
 ## 2026-10-14 — Dependency maintenance
 
 Dependabot PR #64 updates the SHA-pinned upload-artifact action to 7.0.2 in publishing and Scorecard workflows. Python dependencies, integration source, and protocol behavior are unchanged. Python 3.10/3.12 lint, typing, tests, and existing coverage gates must pass before merge.

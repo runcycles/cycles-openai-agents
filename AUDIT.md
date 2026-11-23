@@ -1,5 +1,9 @@
 # Cycles OpenAI Agents SDK Integration — Audit
 
+## 2026-11-23 — Dependency review
+
+PR #72 updates the Scorecard workflow to `ossf/scorecard-action` v2.6.0. Its pinned commit (`23f22cd`) matches the upstream release tag.
+
 ## 2026-10-19 — Dependabot dependency review
 
 Consolidates the following reviewed updates on current main:
